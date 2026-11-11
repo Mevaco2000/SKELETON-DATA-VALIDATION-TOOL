@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
+import weakref
 from typing import Any, Dict, Optional
 
 from .format_converters import (
@@ -51,41 +52,56 @@ class KeypointDatasetAdapter:
             self.output_root = os.path.abspath(output_root)
             os.makedirs(self.output_root, exist_ok=True)
 
-        if self.source_format == "coco_keypoints" and use_ultralytics_for_coco:
-            annotations_dir = (
-                os.path.abspath(coco_annotations_dir)
-                if coco_annotations_dir is not None
-                else self.input_root
-            )
-            images_dir = (
-                os.path.abspath(coco_images_dir)
-                if coco_images_dir is not None
-                else None
-            )
-            self.conversion_info = convert_coco_keypoints_with_ultralytics(
-                coco_annotations_dir=annotations_dir,
-                output_root=self.output_root,
-                copy_images_from=images_dir,
-                split_name=self.split_name,
-            )
-        else:
-            self.conversion_info = convert_registered_format_to_yolo_pose(
-                format_name=self.source_format,
-                input_root=self.input_root,
-                output_root=self.output_root,
-                split_name=self.split_name,
-                copy_images=self.copy_images,
-                generate_split_file=True,
-            )
+        try:
+            if self.source_format == "coco_keypoints" and use_ultralytics_for_coco:
+                annotations_dir = (
+                    os.path.abspath(coco_annotations_dir)
+                    if coco_annotations_dir is not None
+                    else self.input_root
+                )
+                images_dir = (
+                    os.path.abspath(coco_images_dir)
+                    if coco_images_dir is not None
+                    else None
+                )
+                self.conversion_info = convert_coco_keypoints_with_ultralytics(
+                    coco_annotations_dir=annotations_dir,
+                    output_root=self.output_root,
+                    copy_images_from=images_dir,
+                    split_name=self.split_name,
+                )
+            else:
+                self.conversion_info = convert_registered_format_to_yolo_pose(
+                    format_name=self.source_format,
+                    input_root=self.input_root,
+                    output_root=self.output_root,
+                    split_name=self.split_name,
+                    copy_images=self.copy_images,
+                    generate_split_file=True,
+                )
 
-        split_file = self.conversion_info.get("split_file")
-        if not split_file:
-            raise ValueError("Conversion did not produce split file path")
+            split_file = self.conversion_info.get("split_file")
+            if not split_file:
+                raise ValueError("Conversion did not produce split file path")
 
-        self.dataset = YOLOPoseDataset(
-            dataset_file=str(split_file),
-            labels_dir=os.path.join(self.output_root, "labels"),
-        )
+            self.dataset = YOLOPoseDataset(
+                dataset_file=str(split_file),
+                labels_dir=os.path.join(self.output_root, "labels"),
+            )
+        except BaseException:
+            if self._owns_output_root:
+                shutil.rmtree(self.output_root, ignore_errors=True)
+            raise
+
+        # The temporary folder is removed when the dataset object is garbage
+        # collected (or on close()/exit), not when the adapter is: the dataset
+        # returned by as_yolo_dataset() reads files from that folder and may
+        # outlive the adapter.
+        self._cleanup = None
+        if self._owns_output_root:
+            self._cleanup = weakref.finalize(
+                self.dataset, shutil.rmtree, self.output_root, ignore_errors=True
+            )
 
     @classmethod
     def from_coco(
@@ -145,25 +161,23 @@ class KeypointDatasetAdapter:
         }
 
     def close(self) -> None:
-        """Release resources and remove temporary conversion output if owned."""
+        """Remove the temporary conversion output now, if the adapter owns it.
+
+        After this the dataset returned by ``as_yolo_dataset()`` can no longer
+        load images or labels.
+        """
         if self._closed:
             return
         self._closed = True
 
-        if self._owns_output_root and os.path.isdir(self.output_root):
-            shutil.rmtree(self.output_root, ignore_errors=True)
+        if self._cleanup is not None:
+            self._cleanup()
 
     def __enter__(self) -> "KeypointDatasetAdapter":
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
-
-    def __del__(self) -> None:
-        try:
-            self.close()
-        except Exception:
-            pass
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -179,4 +193,7 @@ class KeypointDatasetAdapter:
 
         This lets existing code call dataset methods directly on adapter.
         """
+        # Avoid infinite recursion when __init__ failed before self.dataset was set.
+        if item == "dataset" or item.startswith("__"):
+            raise AttributeError(item)
         return getattr(self.dataset, item)

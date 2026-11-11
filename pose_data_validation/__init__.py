@@ -1,19 +1,19 @@
 """
-Professional utilities package for YOLO pose dataset validation and manipulation.
+Validation of keypoint (skeleton) annotations in YOLO Pose datasets.
 
 Provides tools for:
-- Keypoint analysis and visualization
-- Duplicate detection using CLIP embeddings
-- Dataset statistics and Excel reporting
-- YOLO model training and evaluation
-- Dataset operations (flatten, merge, split, convert)
+- keypoint anomaly ranking (inter-keypoint distances, LBP texture, segmentation masks),
+- the merged ranking of these signals (MergedRankingEvaluator),
+- near-duplicate detection with CLIP embeddings,
+- model-in-the-loop validation with YOLO Pose models,
+- dataset operations (flatten, merge, split, convert, synthetic keypoint noise).
 """
 
 from importlib import import_module
 from typing import Any, Dict, Tuple
 
 __version__ = "0.1.0"
-__author__ = "Rafal Wysocki, 2026"
+__author__ = "Rafał Wysocki, Poznań University of Technology"
 
 _LAZY_IMPORTS: Dict[str, Tuple[str, str]] = {
     

@@ -29,8 +29,12 @@ runs/
 /weryfikacje/
 
 # Package uploads
-utils/uploaded/
+pose_data_validation/uploaded/
 
 # OS
 .DS_Store
 Thumbs.db
+
+# Package build artifacts
+build/
+dist/

@@ -6,6 +6,5 @@ tqdm==4.70.1
 scikit-learn==1.9.1
 torch==2.14.1
 ultralytics==8.4.173
-streamlit==1.65.0
 open-clip-torch==3.3.0
 faiss-cpu==1.15.1

@@ -9,7 +9,6 @@ from typing import List, Tuple, Optional, Union, Callable, Dict, Any, Sequence
 import numpy as np
 import cv2
 import torch
-import pandas as pd
 from PIL import Image
 from tqdm import tqdm
 import open_clip
@@ -36,11 +35,10 @@ from sklearn.tree import DecisionTreeRegressor
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.neural_network import MLPRegressor
 
-from .image_validation import YPImageValidation, normalize_distance_connections
+from .image_validation import YPImageValidation, labelled_keypoint_mask, normalize_distance_connections
 from ..config import (
     CLIP_MODEL_NAME,
     CLIP_MODEL_PRETRAINED,
-    VALID_IMAGE_EXTENSIONS,
     DEFAULT_K_NEIGHBORS,
 )
 
@@ -66,48 +64,52 @@ DEFAULT_REGRESSORS = {
 }
 
 
+# The tuples below must list every class in the model's label order, because
+# the position in the tuple is the class id the model outputs. Do not trim them.
+
+# torchvision Mask R-CNN (COCO_V1 weights): 91 ids, including "N/A" gaps.
 COCO_DETECTION_CATEGORIES = (
-    "__background__",
-    "person",
-    # Animals
-    "bird",
-    "cat",
-    "dog",
-    "horse",
-    "sheep",
-    "cow",
-    "elephant",
-    "bear",
-    "zebra",
-    "giraffe",
+    "__background__", "person", "bicycle", "car", "motorcycle", "airplane", "bus",
+    "train", "truck", "boat", "traffic light", "fire hydrant", "N/A", "stop sign",
+    "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+    "elephant", "bear", "zebra", "giraffe", "N/A", "backpack", "umbrella", "N/A",
+    "N/A", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard",
+    "sports ball", "kite", "baseball bat", "baseball glove", "skateboard",
+    "surfboard", "tennis racket", "bottle", "N/A", "wine glass", "cup", "fork",
+    "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange", "broccoli",
+    "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch",
+    "potted plant", "bed", "N/A", "dining table", "N/A", "N/A", "toilet", "N/A",
+    "tv", "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave",
+    "oven", "toaster", "sink", "refrigerator", "N/A", "book", "clock", "vase",
+    "scissors", "teddy bear", "hair drier", "toothbrush",
 )
 
+# torchvision DeepLabV3 / LRASPP / FCN (COCO_WITH_VOC_LABELS_V1 weights): 21 ids.
 VOC_SEGMENTATION_CLASSES = (
-    "background",
-    "person",
-    # Animals
-    "bird",
-    "cat",
-    "cow",
-    "dog",
-    "horse",
-    "sheep",
+    "__background__", "aeroplane", "bicycle", "bird", "boat", "bottle", "bus",
+    "car", "cat", "chair", "cow", "diningtable", "dog", "horse", "motorbike",
+    "person", "pottedplant", "sheep", "sofa", "train", "tvmonitor",
 )
 
+# Ultralytics YOLO COCO models: 80 contiguous ids.
 COCO_YOLO_CLASSES = (
-    "person",
-    # Animals
-    "bird",
-    "cat",
-    "dog",
-    "horse",
-    "sheep",
-    "cow",
-    "elephant",
-    "bear",
-    "zebra",
-    "giraffe",
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck",
+    "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench",
+    "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra",
+    "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove",
+    "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup",
+    "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch",
+    "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse",
+    "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
+    "refrigerator", "book", "clock", "vase", "scissors", "teddy bear",
+    "hair drier", "toothbrush",
 )
+
+assert len(COCO_DETECTION_CATEGORIES) == 91
+assert len(VOC_SEGMENTATION_CLASSES) == 21
+assert len(COCO_YOLO_CLASSES) == 80
 
 
 def _normalize_class_name(name: str) -> str:
@@ -260,9 +262,11 @@ class YPSetValidation:
         if actual.ndim != 2 or actual.shape[1] < 2:
             return math.inf, np.array([], dtype=float), 0
 
-        visible_mask = np.ones(actual.shape[0], dtype=bool)
+        # Unlabelled keypoints have no ground-truth position, so they never
+        # count, whatever visibility_threshold is.
+        visible_mask = labelled_keypoint_mask(actual)
         if visibility_threshold is not None and actual.shape[1] >= 3:
-            visible_mask = actual[:, 2] >= float(visibility_threshold)
+            visible_mask &= actual[:, 2] >= float(visibility_threshold)
 
         if predicted_keypoints is None:
             per_keypoint_errors = np.full(actual.shape[0], np.nan, dtype=float)
@@ -682,6 +686,36 @@ class YPSetValidation:
             "model": resolved_model,
         }
 
+    def _sample_loader_by_path(self) -> Callable[[str], Optional[Any]]:
+        """Return a function that loads one dataset sample by image path, on demand.
+
+        Loading one sample at a time keeps a single decoded image in memory
+        instead of decoding every image of the dataset up front.
+        """
+        valid_pairs = getattr(self.dataset, "_valid_pairs", None)
+        if valid_pairs is not None and hasattr(type(self.dataset), "__getitem__"):
+            index_by_path = {
+                os.path.abspath(image_path): index
+                for index, (image_path, _) in enumerate(valid_pairs)
+            }
+
+            def load_sample(image_path: str):
+                index = index_by_path.get(os.path.abspath(image_path))
+                if index is None:
+                    return None
+                try:
+                    sample = self.dataset[index]
+                except Exception:
+                    # Same as dataset iteration: skip a sample whose files became unreadable.
+                    return None
+                return sample if sample.get('image') is not None else None
+
+            return load_sample
+
+        # Datasets without random access: fall back to loading everything once.
+        samples = {os.path.abspath(sample['image_path']): sample for sample in self.dataset}
+        return lambda image_path: samples.get(os.path.abspath(image_path))
+
     @staticmethod
     def _get_sample_person_keypoints(sample) -> List[np.ndarray]:
         """Return a normalized list of per-person keypoint arrays for a sample."""
@@ -1087,8 +1121,8 @@ class YPSetValidation:
         if num_samples < 2:
             raise ValueError("At least two samples are required to train models")
 
-        # DON'T remove columns globally - instead, handle NaN per-model
-        # This allows training on all distance types, using only valid rows for each model
+        # Columns with some NaN are kept: each model is trained only on the rows
+        # where its target and inputs are valid. Only all-NaN columns are dropped.
         valid_distance_indices = distance_indices.copy()
         
         # Calculate how many valid (non-NaN) distances each row has
@@ -1127,37 +1161,44 @@ class YPSetValidation:
             indices = list(range(1, distance_matrix_filtered.shape[1] - 1))
 
         # Train a model for each distance, using only rows with valid data for that model
+        trained_distance_indices: List[int] = []
+        all_positions = np.arange(distance_matrix_filtered.shape[1])
         for idx in indices:
-            X = np.delete(distance_matrix_filtered, idx, axis=1)
+            feature_positions = np.delete(all_positions, idx)
+            X = distance_matrix_filtered[:, feature_positions]
             y = distance_matrix_filtered[:, idx]
-            
+
             # Find rows where BOTH y and ALL features X are valid (not NaN)
             valid_y = ~np.isnan(y)
             valid_X = ~np.isnan(X).any(axis=1)
             valid_rows = valid_y & valid_X
-            
+
             # Train on valid rows only
             if valid_rows.sum() < 2:
                 if verbose:
                     print(f"  Skipping distance {valid_distance_indices[idx]}: < 2 valid samples")
                 continue
-            
+
             X_train = X[valid_rows, :]
             y_train = y[valid_rows]
-            
+
             model = model_factory()
             model.fit(X_train, y_train)
+            # Original distance columns used as inputs. Columns dropped above
+            # (all NaN) are not among them, so predict_distance_anomalies must
+            # build its inputs from this list, not from "all columns but y".
+            model.feature_distance_indices_ = valid_distance_indices[feature_positions].copy()
             models.append(model)
+            # Track the target of every model actually trained, so a skipped
+            # distance does not shift the model -> distance mapping.
+            trained_distance_indices.append(int(valid_distance_indices[idx]))
 
-        # Return models AND the valid distance indices they correspond to
-        trained_distance_indices = valid_distance_indices[indices]
-        
         if len(models) == 0:
             if verbose:
                 print("  No models could be trained (insufficient valid data per distance type).")
             return [], np.array([], dtype=np.int64)
-        
-        return models, trained_distance_indices[: len(models)]
+
+        return models, np.asarray(trained_distance_indices, dtype=np.int64)
     
     def predict_distance_anomalies(
         self,
@@ -1238,8 +1279,7 @@ class YPSetValidation:
         if distance_matrix.size == 0:
             raise ValueError("Dataset has no valid keypoint sequences")
 
-        # Don't remove columns globally - keep them all and handle NaN per-row per-column
-        # This allows us to use all available distance data
+        # Columns with some NaN are kept; NaN is handled per model below.
         
         # Filter rows: keep only persons with at least 2 valid (non-NaN) distances
         num_valid_per_row = (~np.isnan(distance_matrix)).sum(axis=1)
@@ -1260,10 +1300,32 @@ class YPSetValidation:
                 f"number of models ({len(models)}) does not match expected number of distance indices ({len(valid_distance_indices)})"
             )
 
+        num_columns = distance_matrix_filtered.shape[1]
+        valid_distance_indices = np.asarray(valid_distance_indices, dtype=np.int64)
+        if valid_distance_indices.size and int(valid_distance_indices.max()) >= num_columns:
+            raise ValueError(
+                f"Models predict distance {int(valid_distance_indices.max())}, but only {num_columns} "
+                "distance columns were found. distance_connections and visibility_threshold must match training."
+            )
+
         # Compute predictions using only valid rows for each model
         preds = []
         for model_idx, original_idx in enumerate(valid_distance_indices):
-            X = np.delete(distance_matrix_filtered, original_idx, axis=1)
+            original_idx = int(original_idx)
+            feature_indices = getattr(models[model_idx], "feature_distance_indices_", None)
+            if feature_indices is None:
+                # No recorded input columns (model not built by train_distance_models):
+                # use every column except the target.
+                X = np.delete(distance_matrix_filtered, original_idx, axis=1)
+            else:
+                feature_indices = np.asarray(feature_indices, dtype=np.int64)
+                if feature_indices.size and int(feature_indices.max()) >= num_columns:
+                    raise ValueError(
+                        f"Model for distance {original_idx} was trained on distance column "
+                        f"{int(feature_indices.max())}, which is missing here. "
+                        "distance_connections and visibility_threshold must match training."
+                    )
+                X = distance_matrix_filtered[:, feature_indices]
             y_actual = distance_matrix_filtered[:, original_idx]
             
             # Find rows where BOTH y and ALL features X are valid (not NaN)
@@ -1367,7 +1429,7 @@ class YPSetValidation:
         }
 
     
-    # ==================== LBP Anomaly Detection (Isolation Forest) ====================
+    # ==================== LBP Anomaly Detection ====================
 
     @staticmethod
     def _lbp_decimals_to_feature_matrix(decimals: Sequence[Any]) -> np.ndarray:
@@ -1386,6 +1448,181 @@ class YPSetValidation:
             [[(d >> i) & 1 for i in range(n_bits - 1, -1, -1)] for d in int_decimals],
             dtype=np.float64,
         )
+
+    def _predict_lbp_anomalies_by_groups(
+        self,
+        score_keypoint: Callable[[np.ndarray], Tuple[np.ndarray, np.ndarray, Dict[str, Any], Any]],
+        patch_size: int,
+        visibility_threshold: float,
+        similarity_threshold: float,
+        similarity_k: int,
+        min_group_size: int,
+        device: Optional[str],
+        image_folder: Optional[str],
+        verbose: bool,
+        precomputed_embeddings: Optional[np.ndarray],
+        precomputed_image_paths: Optional[List[str]],
+        keep_models: bool = False,
+    ) -> Dict[str, Any]:
+        """Shared LBP pipeline of the ``predict_lbp_anomalies_by_embedding_groups*`` methods.
+
+        Groups similar images by embedding, collects visible-keypoint LBP features
+        per group and keypoint index, scores each (group, keypoint) sample set with
+        ``score_keypoint`` and ranks persons by their highest keypoint score.
+
+        ``score_keypoint(features)`` receives the ``(N, n_bits)`` feature matrix and
+        returns ``(scores, is_anomalous, report_fields, model)``: per-sample scores
+        (higher = more anomalous), per-sample anomaly flags, extra fields for the
+        keypoint report and the fitted model (kept only when ``keep_models``).
+        """
+        if precomputed_embeddings is not None and precomputed_image_paths is not None:
+            embeddings = precomputed_embeddings
+            embedding_image_paths = precomputed_image_paths
+        else:
+            embeddings, embedding_image_paths = self._get_embeddings_with_image_paths(
+                device=device,
+                image_folder=image_folder,
+                verbose=verbose,
+            )
+
+        if embeddings.shape[0] == 0:
+            if verbose:
+                print("   No embeddings computed for dataset images.")
+            return {'records': [], 'groups': [], 'all_similarity_groups': [], 'trained_group_ids': []}
+
+        if embeddings.shape[0] == 1:
+            all_similarity_groups: List[List[int]] = []
+        else:
+            effective_k = max(1, min(int(similarity_k), embeddings.shape[0]))
+            all_similarity_groups = [
+                sorted(group)
+                for group in self.build_similarity_groups(embeddings, threshold=similarity_threshold, k=effective_k)
+            ]
+
+        trained_groups = [
+            (group_id, group)
+            for group_id, group in enumerate(all_similarity_groups)
+            if len(group) > min_group_size
+        ]
+
+        if verbose:
+            print(f"All similarity groups: {len(all_similarity_groups)}")
+            print(f"Training groups with size > {min_group_size}: {len(trained_groups)}")
+
+        if not trained_groups:
+            return {'records': [], 'groups': [], 'all_similarity_groups': all_similarity_groups, 'trained_group_ids': []}
+
+        load_sample_by_path = self._sample_loader_by_path()
+        flat_records: List[Dict[str, Any]] = []
+        group_reports: List[Dict[str, Any]] = []
+
+        for group_id, group in trained_groups:
+            group_image_paths = [embedding_image_paths[index] for index in group]
+            keypoint_samples: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+            image_records: List[Dict[str, Any]] = []
+
+            for image_path in group_image_paths:
+                sample = load_sample_by_path(image_path)
+                if sample is None:
+                    continue
+
+                person_reports = []
+                for person_index, keypoints in enumerate(self._get_sample_person_keypoints(sample)):
+                    keypoints_array = np.asarray(keypoints, dtype=float)
+                    num_keypoints = keypoints_array.shape[0] if keypoints_array.ndim >= 2 else 0
+                    decimal_values = YPImageValidation(sample['image'], keypoints_array).compute_lbp_decimals(
+                        patch_size=patch_size,
+                        visibility_threshold=visibility_threshold,
+                    )
+                    if keypoints_array.size > 0 and keypoints_array.shape[1] >= 3:
+                        visible_indices = np.where(keypoints_array[:, 2] >= visibility_threshold)[0]
+                    else:
+                        visible_indices = np.arange(num_keypoints, dtype=int)
+
+                    person_report = {
+                        'group_id': group_id,
+                        'image_path': image_path,
+                        'person_index': person_index,
+                        'visible_keypoint_indices': visible_indices.copy(),
+                        'keypoint_anomaly_scores': np.full(num_keypoints, np.nan, dtype=float),
+                    }
+                    for keypoint_index, decimal_value in zip(visible_indices, decimal_values):
+                        keypoint_samples[int(keypoint_index)].append({
+                            'image_path': image_path,
+                            'decimal_value': decimal_value,
+                            'person_report': person_report,
+                        })
+                    person_reports.append(person_report)
+                    flat_records.append(person_report)
+
+                image_records.append({'group_id': group_id, 'image_path': image_path, 'persons': person_reports})
+
+            keypoint_models: Dict[int, Any] = {}
+            keypoint_group_reports: List[Dict[str, Any]] = []
+            for keypoint_index, kpt_samples in sorted(keypoint_samples.items()):
+                if len(kpt_samples) < 2:
+                    continue
+
+                features = self._lbp_decimals_to_feature_matrix([s['decimal_value'] for s in kpt_samples])
+                scores, is_anomalous, report_fields, model = score_keypoint(features)
+                for sample_info, score, flagged in zip(kpt_samples, scores, is_anomalous):
+                    sample_info['person_report']['keypoint_anomaly_scores'][keypoint_index] = float(score)
+                    if flagged:
+                        sample_info['person_report'].setdefault('_anomaly_kpts', set()).add(keypoint_index)
+
+                keypoint_models[keypoint_index] = model
+                keypoint_group_reports.append({
+                    'keypoint_index': keypoint_index,
+                    'sample_count': len(kpt_samples),
+                    'image_count': len({s['image_path'] for s in kpt_samples}),
+                    **report_fields,
+                })
+
+            group_report = {
+                'group_id': group_id,
+                'group_size': len(group),
+                'image_paths': group_image_paths,
+                'images': image_records,
+            }
+            if keep_models:
+                group_report['keypoint_models'] = keypoint_models
+            group_report['keypoint_reports'] = keypoint_group_reports
+            group_reports.append(group_report)
+
+        for record in flat_records:
+            keypoint_scores = np.asarray(record['keypoint_anomaly_scores'], dtype=float)
+            finite_scores = keypoint_scores[np.isfinite(keypoint_scores)]
+            record['max_anomaly_score'] = float(np.max(finite_scores)) if finite_scores.size > 0 else np.nan
+            record['mean_anomaly_score'] = float(np.mean(finite_scores)) if finite_scores.size > 0 else np.nan
+            record['is_anomaly'] = bool(record.pop('_anomaly_kpts', set()))
+
+        # Persons without any scored keypoint (NaN) go last.
+        flat_records.sort(
+            key=lambda record: (
+                np.isfinite(record['max_anomaly_score']),
+                record['max_anomaly_score'] if np.isfinite(record['max_anomaly_score']) else float('-inf'),
+            ),
+            reverse=True,
+        )
+        for rank, record in enumerate(flat_records, start=1):
+            record['rank'] = rank
+
+        return {
+            'records': flat_records,
+            'groups': group_reports,
+            'all_similarity_groups': all_similarity_groups,
+            'trained_group_ids': [group_id for group_id, _ in trained_groups],
+        }
+
+    @staticmethod
+    def _min_max_scale(values: np.ndarray, invert: bool = False) -> np.ndarray:
+        """Scale values to [0, 1] (``1 - scaled`` with ``invert``); all zeros when constant."""
+        min_value = float(np.min(values))
+        max_value = float(np.max(values))
+        if max_value <= min_value:
+            return np.zeros(len(values), dtype=float)
+        scaled = (values - min_value) / (max_value - min_value)
+        return 1.0 - scaled if invert else scaled
 
     def predict_lbp_anomalies_by_embedding_groups(
         self,
@@ -1410,203 +1647,34 @@ class YPSetValidation:
         2. Keep only groups larger than ``min_group_size`` images.
         3. Compute visible-keypoint LBP decimals for images in each kept group.
         4. For each keypoint index inside each group, train a separate Isolation Forest.
+           Its ``score_samples`` are min-max scaled and inverted (1 = most anomalous);
+           a keypoint is anomalous when the forest predicts ``-1``.
 
         Returns:
             Dictionary with keys:
             - ``records``: flat list of per-person results with group id, image path,
                             person index, per-keypoint anomaly scores, and max anomaly score;
                             sorted descending by max anomaly score
-            - ``groups``: detailed group reports
+            - ``groups``: detailed group reports (including the fitted ``keypoint_models``)
             - ``all_similarity_groups``: all image similarity groups from embeddings
             - ``trained_group_ids``: ids of groups used for model training
         """
-        if precomputed_embeddings is not None and precomputed_image_paths is not None:
-            embeddings = precomputed_embeddings
-            embedding_image_paths = precomputed_image_paths
-        else:
-            embeddings, embedding_image_paths = self._get_embeddings_with_image_paths(
-                device=device,
-                image_folder=image_folder,
-                verbose=verbose,
+        def score_keypoint(features):
+            model = IsolationForest(
+                contamination=contamination,
+                random_state=random_state,
+                n_estimators=n_estimators,
             )
+            model.fit(features)
+            normalized_scores = self._min_max_scale(model.score_samples(features), invert=True)
+            predictions = model.predict(features)  # -1 = anomaly, 1 = inlier
+            return normalized_scores, predictions == -1, {'scores': normalized_scores.copy()}, model
 
-        if embeddings.shape[0] == 0:
-            if verbose:
-                print("   No embeddings computed for dataset images.")
-            return {
-                'records': [],
-                'groups': [],
-                'all_similarity_groups': [],
-                'trained_group_ids': [],
-            }
-
-        if embeddings.shape[0] == 1:
-            all_similarity_groups: List[List[int]] = []
-        else:
-            effective_k = max(1, min(int(similarity_k), embeddings.shape[0]))
-            all_similarity_groups = [
-                sorted(group)
-                for group in self.build_similarity_groups(
-                    embeddings,
-                    threshold=similarity_threshold,
-                    k=effective_k,
-                )
-            ]
-
-        trained_groups = [
-            (group_id, group)
-            for group_id, group in enumerate(all_similarity_groups)
-            if len(group) > min_group_size
-        ]
-
-        if verbose:
-            print(f"All similarity groups: {len(all_similarity_groups)}")
-            print(f"Training groups with size > {min_group_size}: {len(trained_groups)}")
-
-        if not trained_groups:
-            return {
-                'records': [],
-                'groups': [],
-                'all_similarity_groups': all_similarity_groups,
-                'trained_group_ids': [],
-            }
-
-        sample_by_path = {
-            os.path.abspath(sample['image_path']): sample
-            for sample in self.dataset
-        }
-
-        flat_records: List[Dict[str, Any]] = []
-        group_reports: List[Dict[str, Any]] = []
-
-        for group_id, group in trained_groups:
-            group_image_paths = [embedding_image_paths[index] for index in group]
-            group_path_set = {os.path.abspath(path) for path in group_image_paths}
-            keypoint_samples: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
-            image_records: List[Dict[str, Any]] = []
-
-            for image_path in group_image_paths:
-                sample = sample_by_path.get(os.path.abspath(image_path))
-                if sample is None:
-                    continue
-
-                person_reports = []
-                person_keypoints = self._get_sample_person_keypoints(sample)
-                for person_index, keypoints in enumerate(person_keypoints):
-                    keypoints_array = np.asarray(keypoints, dtype=float)
-                    num_keypoints = keypoints_array.shape[0] if keypoints_array.ndim >= 2 else 0
-                    keypoint_scores = np.full(num_keypoints, np.nan, dtype=float)
-
-                    validator = YPImageValidation(sample['image'], keypoints_array)
-                    decimal_values = validator.compute_lbp_decimals(
-                        patch_size=patch_size,
-                        visibility_threshold=visibility_threshold,
-                    )
-
-                    if keypoints_array.size > 0 and keypoints_array.shape[1] >= 3:
-                        visible_indices = np.where(keypoints_array[:, 2] >= visibility_threshold)[0]
-                    else:
-                        visible_indices = np.arange(num_keypoints, dtype=int)
-
-                    person_report = {
-                        'group_id': group_id,
-                        'image_path': image_path,
-                        'person_index': person_index,
-                        'visible_keypoint_indices': visible_indices.copy(),
-                        'keypoint_anomaly_scores': keypoint_scores,
-                    }
-
-                    for keypoint_index, decimal_value in zip(visible_indices, decimal_values):
-                        keypoint_samples[int(keypoint_index)].append({
-                            'image_path': image_path,
-                            'person_index': person_index,
-                            'decimal_value': decimal_value,
-                            'person_report': person_report,
-                        })
-
-                    person_reports.append(person_report)
-                    flat_records.append(person_report)
-
-                image_records.append({
-                    'group_id': group_id,
-                    'image_path': image_path,
-                    'persons': person_reports,
-                })
-
-            keypoint_models: Dict[int, IsolationForest] = {}
-            keypoint_group_reports: List[Dict[str, Any]] = []
-
-            for keypoint_index, samples in sorted(keypoint_samples.items()):
-                if len(samples) < 2:
-                    continue
-
-                decimal_values = [sample['decimal_value'] for sample in samples]
-                X = self._lbp_decimals_to_feature_matrix(decimal_values)
-
-                model = IsolationForest(
-                    contamination=contamination,
-                    random_state=random_state,
-                    n_estimators=n_estimators,
-                )
-                model.fit(X)
-
-                scores = model.score_samples(X)
-                predictions = model.predict(X)  # -1 = anomaly, 1 = inlier
-                min_score = float(np.min(scores))
-                max_score = float(np.max(scores))
-                if max_score > min_score:
-                    normalized_scores = 1.0 - ((scores - min_score) / (max_score - min_score))
-                else:
-                    normalized_scores = np.zeros_like(scores)
-
-                for sample_info, normalized_score, prediction in zip(samples, normalized_scores, predictions):
-                    sample_info['person_report']['keypoint_anomaly_scores'][keypoint_index] = float(normalized_score)
-                    if prediction == -1:
-                        sample_info['person_report'].setdefault('_anomaly_kpts', set()).add(keypoint_index)
-
-                keypoint_models[keypoint_index] = model
-                keypoint_group_reports.append({
-                    'keypoint_index': keypoint_index,
-                    'sample_count': len(samples),
-                    'image_count': len({sample['image_path'] for sample in samples}),
-                    'scores': normalized_scores.copy(),
-                })
-
-            group_reports.append({
-                'group_id': group_id,
-                'group_size': len(group),
-                'image_paths': group_image_paths,
-                'images': image_records,
-                'keypoint_models': keypoint_models,
-                'keypoint_reports': keypoint_group_reports,
-            })
-
-        for record in flat_records:
-            keypoint_scores = np.asarray(record['keypoint_anomaly_scores'], dtype=float)
-            finite_scores = keypoint_scores[np.isfinite(keypoint_scores)]
-            max_score = float(np.max(finite_scores)) if finite_scores.size > 0 else np.nan
-            mean_score = float(np.mean(finite_scores)) if finite_scores.size > 0 else np.nan
-            record['max_anomaly_score'] = max_score
-            record['mean_anomaly_score'] = mean_score
-            record['is_anomaly'] = bool(record.pop('_anomaly_kpts', set()))
-
-        flat_records.sort(
-            key=lambda record: (
-                np.isfinite(record['max_anomaly_score']),
-                record['max_anomaly_score'] if np.isfinite(record['max_anomaly_score']) else float('-inf'),
-            ),
-            reverse=True,
+        return self._predict_lbp_anomalies_by_groups(
+            score_keypoint, patch_size, visibility_threshold, similarity_threshold, similarity_k,
+            min_group_size, device, image_folder, verbose, precomputed_embeddings, precomputed_image_paths,
+            keep_models=True,
         )
-
-        for rank, record in enumerate(flat_records, start=1):
-            record['rank'] = rank
-
-        return {
-            'records': flat_records,
-            'groups': group_reports,
-            'all_similarity_groups': all_similarity_groups,
-            'trained_group_ids': [group_id for group_id, _ in trained_groups],
-        }
 
     def predict_lbp_anomalies_by_embedding_groups_zscore(
         self,
@@ -1622,225 +1690,29 @@ class YPSetValidation:
         precomputed_embeddings: Optional[np.ndarray] = None,
         precomputed_image_paths: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """Detect LBP anomalies per group and keypoint using Z-score.
+        """Detect LBP anomalies per group and keypoint using a Z-score.
 
-        Works identically to :meth:`predict_lbp_anomalies_by_embedding_groups` but
-        replaces the Isolation Forest with a simple Z-score approach:
-
-        1. Build image similarity groups from CLIP embeddings.
-        2. Keep only groups larger than ``min_group_size`` images.
-        3. Compute visible-keypoint LBP decimals for images in each kept group.
-        4. For each keypoint index inside each group, compute mean and std of the
-           log1p-bit-length feature across all samples.
-        5. Assign ``z_score = |x - mean| / std`` as the anomaly score for each
-           keypoint observation. A sample is flagged as an anomaly when any of its
-           keypoint Z-scores exceed ``z_threshold``.
-
-        Args:
-            patch_size: LBP patch size in pixels.
-            visibility_threshold: Minimum YOLO visibility value to consider a keypoint visible.
-            z_threshold: Absolute Z-score above which a keypoint is flagged as anomalous.
-                Default is 2.0 (roughly the top ~5 % of a normal distribution).
-            similarity_threshold: Cosine similarity threshold for grouping images.
-            similarity_k: Number of nearest neighbours to consider during grouping.
-            min_group_size: Minimum group size to enable Z-score estimation.
-            device: Optional inference device for CLIP (``"cuda"`` / ``"cpu"``).
-            image_folder: Optional image folder override (forwarded to embedding computation).
-            verbose: Print progress information.
-            precomputed_embeddings: Optional pre-computed CLIP embeddings array.
-            precomputed_image_paths: Image paths corresponding to ``precomputed_embeddings``.
-
-        Returns:
-            Dictionary with keys:
-            - ``records``: flat list of per-person results with ``group_id``,
-              ``image_path``, ``person_index``, ``keypoint_anomaly_scores``
-              (absolute Z-scores per keypoint), ``max_anomaly_score``,
-              ``mean_anomaly_score``, ``is_anomaly``, and ``rank``;
-              sorted descending by ``max_anomaly_score``.
-            - ``groups``: detailed per-group reports including per-keypoint mean,
-              std, and sample Z-scores.
-            - ``all_similarity_groups``: all image similarity groups from embeddings.
-            - ``trained_group_ids``: ids of groups used for Z-score estimation.
+        Same pipeline as :meth:`predict_lbp_anomalies_by_embedding_groups`, but each
+        sample's score is ``|d - mean(d)| / std(d)``, where ``d`` is the distance of
+        its LBP bit vector from the group's mean bit vector. A keypoint is anomalous
+        when its Z-score exceeds ``z_threshold`` (default 2.0, roughly the top 5 %
+        of a normal distribution). Keypoint reports contain ``mean``, ``std`` and
+        ``z_scores``.
         """
-        if precomputed_embeddings is not None and precomputed_image_paths is not None:
-            embeddings = precomputed_embeddings
-            embedding_image_paths = precomputed_image_paths
-        else:
-            embeddings, embedding_image_paths = self._get_embeddings_with_image_paths(
-                device=device,
-                image_folder=image_folder,
-                verbose=verbose,
-            )
+        def score_keypoint(features):
+            distances = np.linalg.norm(features - features.mean(axis=0), axis=1)
+            mean_val = float(np.mean(distances))
+            std_val = float(np.std(distances))
+            if std_val == 0.0:
+                z_scores = np.zeros(len(distances), dtype=float)
+            else:
+                z_scores = np.abs((distances - mean_val) / std_val)
+            return z_scores, z_scores > z_threshold, {'mean': mean_val, 'std': std_val, 'z_scores': z_scores.copy()}, None
 
-        if embeddings.shape[0] == 0:
-            if verbose:
-                print("   No embeddings computed for dataset images.")
-            return {
-                'records': [],
-                'groups': [],
-                'all_similarity_groups': [],
-                'trained_group_ids': [],
-            }
-
-        if embeddings.shape[0] == 1:
-            all_similarity_groups: List[List[int]] = []
-        else:
-            effective_k = max(1, min(int(similarity_k), embeddings.shape[0]))
-            all_similarity_groups = [
-                sorted(group)
-                for group in self.build_similarity_groups(
-                    embeddings,
-                    threshold=similarity_threshold,
-                    k=effective_k,
-                )
-            ]
-
-        trained_groups = [
-            (group_id, group)
-            for group_id, group in enumerate(all_similarity_groups)
-            if len(group) > min_group_size
-        ]
-
-        if verbose:
-            print(f"All similarity groups: {len(all_similarity_groups)}")
-            print(f"Training groups with size > {min_group_size}: {len(trained_groups)}")
-
-        if not trained_groups:
-            return {
-                'records': [],
-                'groups': [],
-                'all_similarity_groups': all_similarity_groups,
-                'trained_group_ids': [],
-            }
-
-        sample_by_path = {
-            os.path.abspath(sample['image_path']): sample
-            for sample in self.dataset
-        }
-
-        flat_records: List[Dict[str, Any]] = []
-        group_reports: List[Dict[str, Any]] = []
-
-        for group_id, group in trained_groups:
-            group_image_paths = [embedding_image_paths[index] for index in group]
-            keypoint_samples: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
-            image_records: List[Dict[str, Any]] = []
-
-            for image_path in group_image_paths:
-                sample = sample_by_path.get(os.path.abspath(image_path))
-                if sample is None:
-                    continue
-
-                person_reports = []
-                person_keypoints = self._get_sample_person_keypoints(sample)
-                for person_index, keypoints in enumerate(person_keypoints):
-                    keypoints_array = np.asarray(keypoints, dtype=float)
-                    num_keypoints = keypoints_array.shape[0] if keypoints_array.ndim >= 2 else 0
-                    keypoint_scores = np.full(num_keypoints, np.nan, dtype=float)
-
-                    validator = YPImageValidation(sample['image'], keypoints_array)
-                    decimal_values = validator.compute_lbp_decimals(
-                        patch_size=patch_size,
-                        visibility_threshold=visibility_threshold,
-                    )
-
-                    if keypoints_array.size > 0 and keypoints_array.shape[1] >= 3:
-                        visible_indices = np.where(keypoints_array[:, 2] >= visibility_threshold)[0]
-                    else:
-                        visible_indices = np.arange(num_keypoints, dtype=int)
-
-                    person_report = {
-                        'group_id': group_id,
-                        'image_path': image_path,
-                        'person_index': person_index,
-                        'visible_keypoint_indices': visible_indices.copy(),
-                        'keypoint_anomaly_scores': keypoint_scores,
-                    }
-
-                    for keypoint_index, decimal_value in zip(visible_indices, decimal_values):
-                        keypoint_samples[int(keypoint_index)].append({
-                            'image_path': image_path,
-                            'person_index': person_index,
-                            'decimal_value': decimal_value,
-                            'person_report': person_report,
-                        })
-
-                    person_reports.append(person_report)
-                    flat_records.append(person_report)
-
-                image_records.append({
-                    'group_id': group_id,
-                    'image_path': image_path,
-                    'persons': person_reports,
-                })
-
-            keypoint_group_reports: List[Dict[str, Any]] = []
-
-            for keypoint_index, kpt_samples in sorted(keypoint_samples.items()):
-                if len(kpt_samples) < 2:
-                    continue
-
-                decimal_values = [s['decimal_value'] for s in kpt_samples]
-                features = self._lbp_decimals_to_feature_matrix(decimal_values)  # (N, n_bits)
-                mean_vec = features.mean(axis=0)  # (n_bits,) - typical bit pattern in group
-                distances = np.linalg.norm(features - mean_vec, axis=1)  # (N,) - one scalar per sample
-
-                mean_val = float(np.mean(distances))
-                std_val = float(np.std(distances))
-
-                if std_val == 0.0:
-                    z_scores = np.zeros(len(distances), dtype=float)
-                else:
-                    z_scores = np.abs((distances - mean_val) / std_val)
-
-                for sample_info, z_score in zip(kpt_samples, z_scores):
-                    sample_info['person_report']['keypoint_anomaly_scores'][keypoint_index] = float(z_score)
-                    if z_score > z_threshold:
-                        sample_info['person_report'].setdefault('_anomaly_kpts', set()).add(keypoint_index)
-
-                keypoint_group_reports.append({
-                    'keypoint_index': keypoint_index,
-                    'sample_count': len(kpt_samples),
-                    'image_count': len({s['image_path'] for s in kpt_samples}),
-                    'mean': mean_val,
-                    'std': std_val,
-                    'z_scores': z_scores.copy(),
-                })
-
-            group_reports.append({
-                'group_id': group_id,
-                'group_size': len(group),
-                'image_paths': group_image_paths,
-                'images': image_records,
-                'keypoint_reports': keypoint_group_reports,
-            })
-
-        for record in flat_records:
-            keypoint_scores = np.asarray(record['keypoint_anomaly_scores'], dtype=float)
-            finite_scores = keypoint_scores[np.isfinite(keypoint_scores)]
-            max_score = float(np.max(finite_scores)) if finite_scores.size > 0 else np.nan
-            mean_score = float(np.mean(finite_scores)) if finite_scores.size > 0 else np.nan
-            record['max_anomaly_score'] = max_score
-            record['mean_anomaly_score'] = mean_score
-            record['is_anomaly'] = bool(record.pop('_anomaly_kpts', set()))
-
-        flat_records.sort(
-            key=lambda record: (
-                np.isfinite(record['max_anomaly_score']),
-                record['max_anomaly_score'] if np.isfinite(record['max_anomaly_score']) else float('-inf'),
-            ),
-            reverse=True,
+        return self._predict_lbp_anomalies_by_groups(
+            score_keypoint, patch_size, visibility_threshold, similarity_threshold, similarity_k,
+            min_group_size, device, image_folder, verbose, precomputed_embeddings, precomputed_image_paths,
         )
-
-        for rank, record in enumerate(flat_records, start=1):
-            record['rank'] = rank
-
-        return {
-            'records': flat_records,
-            'groups': group_reports,
-            'all_similarity_groups': all_similarity_groups,
-            'trained_group_ids': [group_id for group_id, _ in trained_groups],
-        }
 
     def predict_lbp_anomalies_by_embedding_groups_ocsvm(
         self,
@@ -1858,235 +1730,25 @@ class YPSetValidation:
         precomputed_embeddings: Optional[np.ndarray] = None,
         precomputed_image_paths: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """Detect LBP anomalies per group and keypoint using One-Class SVM.
+        """Detect LBP anomalies per group and keypoint using a One-Class SVM.
 
-        Works identically to :meth:`predict_lbp_anomalies_by_embedding_groups` but
-        replaces the Isolation Forest with a One-Class SVM:
-
-        1. Build image similarity groups from CLIP embeddings.
-        2. Keep only groups larger than ``min_group_size`` images.
-        3. Compute visible-keypoint LBP decimals for images in each kept group.
-        4. For each keypoint index inside each group, train a separate
-           :class:`sklearn.svm.OneClassSVM` on the log1p-bit-length feature.
-        5. Use the signed decision function value (negated so higher = more
-           anomalous) as the raw score, then min-max normalize it to [0, 1].
-           A sample is flagged as an anomaly when the model predicts ``-1``.
-
-        Args:
-            patch_size: LBP patch size in pixels.
-            visibility_threshold: Minimum YOLO visibility value to consider a
-                keypoint visible.
-            nu: Upper bound on the fraction of outliers and lower bound on the
-                fraction of support vectors (passed to
-                :class:`~sklearn.svm.OneClassSVM`). Must be in (0, 1].
-            kernel: Kernel type for One-Class SVM (``"rbf"``, ``"linear"``,
-                ``"poly"``, ``"sigmoid"``).
-            gamma: Kernel coefficient for ``"rbf"``, ``"poly"``, and
-                ``"sigmoid"`` kernels (``"scale"`` or ``"auto"`` or float).
-            similarity_threshold: Cosine similarity threshold for grouping images.
-            similarity_k: Number of nearest neighbours to consider during grouping.
-            min_group_size: Minimum group size to enable model training.
-            device: Optional inference device for CLIP (``"cuda"`` / ``"cpu"``).
-            image_folder: Optional image folder override.
-            verbose: Print progress information.
-            precomputed_embeddings: Optional pre-computed CLIP embeddings array.
-            precomputed_image_paths: Image paths corresponding to
-                ``precomputed_embeddings``.
-
-        Returns:
-            Dictionary with keys:
-            - ``records``: flat list of per-person results with ``group_id``,
-              ``image_path``, ``person_index``, ``keypoint_anomaly_scores``
-              (normalized [0,1] anomaly scores per keypoint),
-              ``max_anomaly_score``, ``mean_anomaly_score``, ``is_anomaly``,
-              and ``rank``; sorted descending by ``max_anomaly_score``.
-            - ``groups``: detailed per-group reports including per-keypoint
-              sample counts and normalized scores.
-            - ``all_similarity_groups``: all image similarity groups from embeddings.
-            - ``trained_group_ids``: ids of groups used for model training.
+        Same pipeline as :meth:`predict_lbp_anomalies_by_embedding_groups`, but each
+        (group, keypoint) gets a :class:`sklearn.svm.OneClassSVM` (``nu``, ``kernel``,
+        ``gamma`` are passed through). The negated decision function is min-max
+        scaled to [0, 1] (1 = most anomalous); a keypoint is anomalous when the
+        model predicts ``-1``. Keypoint reports contain ``normalized_scores``.
         """
-        if precomputed_embeddings is not None and precomputed_image_paths is not None:
-            embeddings = precomputed_embeddings
-            embedding_image_paths = precomputed_image_paths
-        else:
-            embeddings, embedding_image_paths = self._get_embeddings_with_image_paths(
-                device=device,
-                image_folder=image_folder,
-                verbose=verbose,
-            )
+        def score_keypoint(features):
+            model = OneClassSVM(nu=nu, kernel=kernel, gamma=gamma)
+            model.fit(features)
+            predictions = model.predict(features)  # -1 = anomaly, 1 = inlier
+            normalized_scores = self._min_max_scale(-model.decision_function(features).ravel())
+            return normalized_scores, predictions == -1, {'normalized_scores': normalized_scores.copy()}, None
 
-        if embeddings.shape[0] == 0:
-            if verbose:
-                print("   No embeddings computed for dataset images.")
-            return {
-                'records': [],
-                'groups': [],
-                'all_similarity_groups': [],
-                'trained_group_ids': [],
-            }
-
-        if embeddings.shape[0] == 1:
-            all_similarity_groups: List[List[int]] = []
-        else:
-            effective_k = max(1, min(int(similarity_k), embeddings.shape[0]))
-            all_similarity_groups = [
-                sorted(group)
-                for group in self.build_similarity_groups(
-                    embeddings,
-                    threshold=similarity_threshold,
-                    k=effective_k,
-                )
-            ]
-
-        trained_groups = [
-            (group_id, group)
-            for group_id, group in enumerate(all_similarity_groups)
-            if len(group) > min_group_size
-        ]
-
-        if verbose:
-            print(f"All similarity groups: {len(all_similarity_groups)}")
-            print(f"Training groups with size > {min_group_size}: {len(trained_groups)}")
-
-        if not trained_groups:
-            return {
-                'records': [],
-                'groups': [],
-                'all_similarity_groups': all_similarity_groups,
-                'trained_group_ids': [],
-            }
-
-        sample_by_path = {
-            os.path.abspath(sample['image_path']): sample
-            for sample in self.dataset
-        }
-
-        flat_records: List[Dict[str, Any]] = []
-        group_reports: List[Dict[str, Any]] = []
-
-        for group_id, group in trained_groups:
-            group_image_paths = [embedding_image_paths[index] for index in group]
-            keypoint_samples: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
-            image_records: List[Dict[str, Any]] = []
-
-            for image_path in group_image_paths:
-                sample = sample_by_path.get(os.path.abspath(image_path))
-                if sample is None:
-                    continue
-
-                person_reports = []
-                person_keypoints = self._get_sample_person_keypoints(sample)
-                for person_index, keypoints in enumerate(person_keypoints):
-                    keypoints_array = np.asarray(keypoints, dtype=float)
-                    num_keypoints = keypoints_array.shape[0] if keypoints_array.ndim >= 2 else 0
-                    keypoint_scores = np.full(num_keypoints, np.nan, dtype=float)
-
-                    validator = YPImageValidation(sample['image'], keypoints_array)
-                    decimal_values = validator.compute_lbp_decimals(
-                        patch_size=patch_size,
-                        visibility_threshold=visibility_threshold,
-                    )
-
-                    if keypoints_array.size > 0 and keypoints_array.shape[1] >= 3:
-                        visible_indices = np.where(keypoints_array[:, 2] >= visibility_threshold)[0]
-                    else:
-                        visible_indices = np.arange(num_keypoints, dtype=int)
-
-                    person_report = {
-                        'group_id': group_id,
-                        'image_path': image_path,
-                        'person_index': person_index,
-                        'visible_keypoint_indices': visible_indices.copy(),
-                        'keypoint_anomaly_scores': keypoint_scores,
-                    }
-
-                    for keypoint_index, decimal_value in zip(visible_indices, decimal_values):
-                        keypoint_samples[int(keypoint_index)].append({
-                            'image_path': image_path,
-                            'person_index': person_index,
-                            'decimal_value': decimal_value,
-                            'person_report': person_report,
-                        })
-
-                    person_reports.append(person_report)
-                    flat_records.append(person_report)
-
-                image_records.append({
-                    'group_id': group_id,
-                    'image_path': image_path,
-                    'persons': person_reports,
-                })
-
-            keypoint_group_reports: List[Dict[str, Any]] = []
-
-            for keypoint_index, kpt_samples in sorted(keypoint_samples.items()):
-                if len(kpt_samples) < 2:
-                    continue
-
-                decimal_values = [s['decimal_value'] for s in kpt_samples]
-                X = self._lbp_decimals_to_feature_matrix(decimal_values)
-
-                model = OneClassSVM(nu=nu, kernel=kernel, gamma=gamma)
-                model.fit(X)
-
-                predictions = model.predict(X)          # -1 = anomaly, 1 = inlier
-                raw_scores = -model.decision_function(X).ravel()  # higher = more anomalous
-
-                min_score = float(np.min(raw_scores))
-                max_score = float(np.max(raw_scores))
-                if max_score > min_score:
-                    normalized_scores = (raw_scores - min_score) / (max_score - min_score)
-                else:
-                    normalized_scores = np.zeros(len(raw_scores), dtype=float)
-
-                for sample_info, normalized_score, prediction in zip(
-                    kpt_samples, normalized_scores, predictions
-                ):
-                    sample_info['person_report']['keypoint_anomaly_scores'][keypoint_index] = float(normalized_score)
-                    if prediction == -1:
-                        sample_info['person_report'].setdefault('_anomaly_kpts', set()).add(keypoint_index)
-
-                keypoint_group_reports.append({
-                    'keypoint_index': keypoint_index,
-                    'sample_count': len(kpt_samples),
-                    'image_count': len({s['image_path'] for s in kpt_samples}),
-                    'normalized_scores': normalized_scores.copy(),
-                })
-
-            group_reports.append({
-                'group_id': group_id,
-                'group_size': len(group),
-                'image_paths': group_image_paths,
-                'images': image_records,
-                'keypoint_reports': keypoint_group_reports,
-            })
-
-        for record in flat_records:
-            keypoint_scores = np.asarray(record['keypoint_anomaly_scores'], dtype=float)
-            finite_scores = keypoint_scores[np.isfinite(keypoint_scores)]
-            max_score = float(np.max(finite_scores)) if finite_scores.size > 0 else np.nan
-            mean_score = float(np.mean(finite_scores)) if finite_scores.size > 0 else np.nan
-            record['max_anomaly_score'] = max_score
-            record['mean_anomaly_score'] = mean_score
-            record['is_anomaly'] = bool(record.pop('_anomaly_kpts', set()))
-
-        flat_records.sort(
-            key=lambda record: (
-                np.isfinite(record['max_anomaly_score']),
-                record['max_anomaly_score'] if np.isfinite(record['max_anomaly_score']) else float('-inf'),
-            ),
-            reverse=True,
+        return self._predict_lbp_anomalies_by_groups(
+            score_keypoint, patch_size, visibility_threshold, similarity_threshold, similarity_k,
+            min_group_size, device, image_folder, verbose, precomputed_embeddings, precomputed_image_paths,
         )
-
-        for rank, record in enumerate(flat_records, start=1):
-            record['rank'] = rank
-
-        return {
-            'records': flat_records,
-            'groups': group_reports,
-            'all_similarity_groups': all_similarity_groups,
-            'trained_group_ids': [group_id for group_id, _ in trained_groups],
-        }
 
     @staticmethod
     def _build_similarity_groups(
@@ -2399,10 +2061,10 @@ class YPSetValidation:
                     confidences = result.boxes.conf.detach().cpu().numpy()
                     polygons = result.masks.xy
 
-                    for idx, polygon in enumerate(polygons):
-                        if idx >= len(classes) or classes[idx] != target_class:
+                    for det_idx, polygon in enumerate(polygons):
+                        if det_idx >= len(classes) or classes[det_idx] != target_class:
                             continue
-                        if idx < len(confidences) and confidences[idx] < score_threshold:
+                        if det_idx < len(confidences) and confidences[det_idx] < score_threshold:
                             continue
                         if len(polygon) < 3:
                             continue
@@ -2598,6 +2260,7 @@ class YPSetValidation:
                 image_path = sample['image_path']
 
             person_keypoints = self._get_sample_person_keypoints(sample)
+            mask_has_foreground = bool(np.any(np.asarray(mask) > 0))
 
             if len(person_keypoints) > 1:
                 person_metrics = []
@@ -2613,6 +2276,7 @@ class YPSetValidation:
                 results.append({
                     "image_path": image_path,
                     "person_metrics": person_metrics,
+                    "mask_has_foreground": mask_has_foreground,
                 })
             else:
                 if not person_keypoints:
@@ -2625,6 +2289,7 @@ class YPSetValidation:
                         visibility_threshold=visibility_threshold,
                         mask_tolerance_px=mask_tolerance_px,
                     ),
+                    "mask_has_foreground": mask_has_foreground,
                 })
 
             processed_paths.append(image_path)
@@ -2992,17 +2657,25 @@ class YPSetValidation:
             else:
                 continue
 
-            # Determine if mask was available: check if any keypoint has non-NaN distances
-            mask_available = False
-            for person_index, metrics in enumerate(metric_groups):
-                for row in metrics:
-                    left_distance = float(row["left_distance"])
-                    right_distance = float(row["right_distance"])
-                    if not (np.isnan(left_distance) and np.isnan(right_distance)):
-                        mask_available = True
+            # Mask availability = the mask has foreground pixels. Finite edge
+            # distances are not a substitute: they exist only for keypoints
+            # inside the mask, so a person whose keypoints all fall outside an
+            # existing mask would be misfiled as "without mask".
+            if "mask_has_foreground" in image_result:
+                mask_available = bool(image_result["mask_has_foreground"])
+            else:
+                # Results without the flag (e.g. saved by earlier runs): a finite
+                # edge distance means the person has a mask.
+                mask_available = False
+                for person_index, metrics in enumerate(metric_groups):
+                    for row in metrics:
+                        left_distance = float(row["left_distance"])
+                        right_distance = float(row["right_distance"])
+                        if not (np.isnan(left_distance) and np.isnan(right_distance)):
+                            mask_available = True
+                            break
+                    if mask_available:
                         break
-                if mask_available:
-                    break
 
             # Collect keypoints into appropriate category
             for person_index, metrics in enumerate(metric_groups):

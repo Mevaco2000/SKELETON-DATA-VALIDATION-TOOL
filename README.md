@@ -1,39 +1,69 @@
-# Validation Toolkit for Keypoint Datasets
+# Skeleton Data Validation Tool
 
-This project provides tools for:
+Toolkit for validating keypoint (skeleton) annotations in YOLO Pose datasets:
 
 - keypoint quality validation,
-- mislabeled sample detection,
-- merged ranking based on multiple unsupervised signals,
-- YOLO Pose workflows,
-- format conversion (including COCO keypoints),
-- an interactive Streamlit demo.
+- detection of mislabeled samples,
+- a merged anomaly ranking built from three unsupervised signals: inter-keypoint distances, LBP texture around keypoints and segmentation masks,
+- YOLO Pose dataset operations (merge, split, flatten, duplicate removal, synthetic keypoint noise),
+- format conversion (including COCO keypoints).
 
-Core modules are under `utils/`:
+The code is an installable Python package, `pose_data_validation`:
 
-- `utils/validation` for image- and dataset-level validation,
-- `utils/datasets` for dataset operations, formats, and converters.
+- `pose_data_validation.validation`: image- and dataset-level validation and the merged ranking,
+- `pose_data_validation.datasets`: dataset operations, formats and converters.
+
+Repository layout:
+
+| Path | Contents |
+|---|---|
+| `pose_data_validation/` | the package |
+| `scores_from_publication/` | notebooks with the experiments and results reported in the publication |
+| `example_keypoint_formats_usage.ipynb` | loading datasets in other keypoint formats |
+| `test_validation_smoke.py` | smoke tests |
+
+**Author:** Rafał Wysocki, Poznań University of Technology
 
 ## 1. Requirements
 
-- Python 3.10+
-- Windows/Linux/macOS
-- Optional GPU for faster model execution
+- Python 3.10 or newer
+- Windows, Linux or macOS
+- Optional: an NVIDIA GPU (CUDA) for faster embedding, segmentation and YOLO training
+- Internet access on first use: CLIP weights (`open_clip`) and Ultralytics YOLO weights are downloaded automatically
 
 ## 2. Installation
 
-Clone and install (Windows PowerShell):
+Windows (PowerShell):
 
 ```powershell
-git clone https://github.com/Mevaco2000/SKELETON_DATA_VALIDATION_TOOL.git
-cd SKELETON_DATA_VALIDATION_TOOL
+git clone https://github.com/Mevaco2000/SKELETON-DATA-VALIDATION-TOOL.git
+cd SKELETON-DATA-VALIDATION-TOOL
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 
 python -m pip install --upgrade pip
 pip install -r requirements.txt
+pip install -e .
 ```
-If PowerShell blocks activation with `running scripts is disabled on this system`, run:
+
+Linux / macOS:
+
+```bash
+git clone https://github.com/Mevaco2000/SKELETON-DATA-VALIDATION-TOOL.git
+cd SKELETON-DATA-VALIDATION-TOOL
+python3 -m venv .venv
+source .venv/bin/activate
+
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+pip install -e .
+```
+
+`requirements.txt` pins the dependency versions. `pip install -e .` installs the `pose_data_validation` package in editable mode, so it can be imported from any folder (including the notebooks), and changes to the code take effect without reinstalling.
+
+**GPU.** On Windows, `pip` installs a CPU-only `torch`. For CUDA, first install the `torch` version pinned in `requirements.txt` and the matching `torchvision` from the [PyTorch index](https://pytorch.org/get-started/locally/), then run the commands above.
+
+**PowerShell blocks activation.** If activation fails with `running scripts is disabled on this system`, run:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
@@ -42,12 +72,9 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 This change affects only the current PowerShell session.
 
-If you downloaded a ZIP instead of cloning, extract it and run the same commands from the project root directory (the folder that contains `README.md`, `requirements.txt`, and `utils/`).
+**ZIP download.** If you downloaded a ZIP instead of cloning, extract it and run the same commands (without `git clone`) from the folder that contains `pyproject.toml`.
 
-Notes:
-
-
-Run smoke tests:
+### Check the installation
 
 ```powershell
 python test_validation_smoke.py
@@ -59,10 +86,41 @@ Expected final line:
 All smoke tests passed.
 ```
 
+### Publication notebooks
+
+The notebooks in `scores_from_publication/` contain the saved outputs of the experiments. They use absolute paths to the datasets on the author's machine; change these paths before re-running a notebook.
+
+## 3. Using the package in another project
+
+The library is packaged as `pose-data-validation` (import name `pose_data_validation`).
+Only the library is installed: notebooks and tests stay in this repository.
+
+Install it into the other project's environment straight from GitHub:
+
+```powershell
+pip install "pose-data-validation @ git+https://github.com/Mevaco2000/SKELETON-DATA-VALIDATION-TOOL.git"
+```
+
+For reproducible results, pin a commit or tag by appending `@<commit-or-tag>` to the URL.
+
+Or install it from a local clone in editable mode:
+
+```powershell
+pip install -e path\to\SKELETON-DATA-VALIDATION-TOOL
+```
+
+In the other project's `requirements.txt`:
+
+```text
+pose-data-validation @ git+https://github.com/Mevaco2000/SKELETON-DATA-VALIDATION-TOOL.git
+```
+
+All dependencies (including `torch`, `ultralytics`, `open-clip-torch` and `faiss-cpu`) are installed with the package. For GPU support, install `torch` and `torchvision` first, as described in the GPU note in section 2.
+
 ## 4. Quick API usage
 
 ```python
-from utils import YOLOPoseDataset, YPSetValidation, MergedRankingEvaluator
+from pose_data_validation import YOLOPoseDataset, YPSetValidation, MergedRankingEvaluator
 
 dataset = YOLOPoseDataset("path/to/train.txt")
 validator = YPSetValidation(dataset)
@@ -93,7 +151,7 @@ Registered formats include:
 - `coco_keypoints`
 
 ```python
-from utils.datasets import KeypointDatasetAdapter
+from pose_data_validation.datasets import KeypointDatasetAdapter
 
 with KeypointDatasetAdapter.from_coco(
     annotations_dir="path/to/coco/annotations",
@@ -105,57 +163,3 @@ with KeypointDatasetAdapter.from_coco(
     print("Samples:", len(dataset))
     print(adapter.info())
 ```
-
-## 6. Streamlit demo
-
-Run:
-
-```powershell
-streamlit run streamlit_merged_ranking_demo.py
-```
-
-The UI is fully in English and supports different input formats.
-
-In the sidebar, configure:
-
-- `Input dataset format` (for example `yolo_pose` or `coco_keypoints`),
-- `Dataset path or URL` (directory/file/URL: `.zip`, `.yaml`, `.yml`, `.txt`, `.json`),
-
-Results are written to:
-
-- `streamlit_outputs/run_YYYYMMDD_HHMMSS/`
-
-
-- `combined_ranking.csv`
-- `top_k_ranked_paths.txt`
-
-This repository includes two deployment helper files:
-
-- `runtime.txt` (pins Python to 3.11)
-- `packages.txt` (installs Linux system libs required by OpenCV)
-
-If your dataset ZIP is large (for example ~150 MB or more), make sure `.streamlit/config.toml` is present in the repository root and redeploy so Streamlit applies:
-
-- `server.maxUploadSize = 1024`
-- `server.maxMessageSize = 1024`
-
-Run the full app stack with Docker Compose:
-
-```powershell
-docker compose up --build
-```
-
-Then open:
-
-- `http://localhost:8501`
-
-Stop the app:
-
-```powershell
-docker compose down
-```
-
-Notes:
-
-- `streamlit_outputs/` is mounted as a volume, so generated outputs persist outside the container.
-- `.streamlit/config.toml` is mounted too, so upload limits stay configurable from the repo.

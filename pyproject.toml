@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pose-data-validation"
+dynamic = ["version"]
+description = "Keypoint-annotation validation, anomaly ranking and dataset tools for YOLO Pose datasets."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Rafał Wysocki" }]
+# Minimum versions are the ones the code was tested with (Python 3.10).
+dependencies = [
+    "numpy>=1.26",
+    "opencv-python>=4.10",
+    "Pillow>=12.2",
+    "tqdm>=4.67",
+    "PyYAML>=6.0",
+    "scikit-learn>=1.7",
+    "torch>=2.11",
+    "torchvision>=0.26",
+    "ultralytics>=8.4.14",
+    "open-clip-torch>=3.3",
+    "faiss-cpu>=1.13",
+]
+
+[project.urls]
+Repository = "https://github.com/Mevaco2000/SKELETON-DATA-VALIDATION-TOOL"
+
+[tool.setuptools.dynamic]
+version = { attr = "pose_data_validation.__version__" }
+
+# Only the library goes into the package: no notebooks or tests.
+[tool.setuptools.packages.find]
+include = ["pose_data_validation", "pose_data_validation.*"]

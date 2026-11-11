@@ -36,7 +36,7 @@ def __dir__() -> list[str]:
 
 
 __all__ = [
-    # analysis (removed)
+    # report parsing and comparison
     "parse_results_txt",
     "parse_distance_anomaly_report",
     "compare_results_txt_to_distance_anomalies",
