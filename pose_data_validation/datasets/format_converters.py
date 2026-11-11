@@ -4,41 +4,19 @@ from __future__ import annotations
 
 import os
 import shutil
+import tempfile
 from typing import Dict, List, Optional
 
 import numpy as np
 
-from .dataset_formats import FORMAT_REGISTRY, KeypointAnnotation
+from .dataset_formats import FORMAT_REGISTRY, KeypointAnnotation, bbox_from_keypoints
 from .operations import generate_train_txt_from_images
+from .yolo_pose_dataset import mirrored_label_rel_path
 
 
 def _ensure_yolo_bbox(annotation: KeypointAnnotation) -> List[float]:
-    if annotation.bbox_xywh is not None:
-        return [float(v) for v in annotation.bbox_xywh]
-
-    keypoints = np.asarray(annotation.keypoints, dtype=float)
-    if keypoints.size == 0:
-        return [0.0, 0.0, 0.0, 0.0]
-
-    coords = keypoints[:, :2]
-    if keypoints.shape[1] >= 3:
-        visible_mask = keypoints[:, 2] > 0
-        if np.any(visible_mask):
-            coords = coords[visible_mask]
-
-    if coords.size == 0:
-        return [0.0, 0.0, 0.0, 0.0]
-
-    x_min = float(np.min(coords[:, 0]))
-    y_min = float(np.min(coords[:, 1]))
-    x_max = float(np.max(coords[:, 0]))
-    y_max = float(np.max(coords[:, 1]))
-    return [
-        (x_min + x_max) / 2.0,
-        (y_min + y_max) / 2.0,
-        max(0.0, x_max - x_min),
-        max(0.0, y_max - y_min),
-    ]
+    bbox = annotation.bbox_xywh if annotation.bbox_xywh is not None else bbox_from_keypoints(annotation.keypoints)
+    return [float(v) for v in bbox]
 
 
 def _annotation_to_yolo_line(annotation: KeypointAnnotation) -> str:
@@ -77,9 +55,17 @@ def convert_registered_format_to_yolo_pose(
     """Convert a registered format to YOLO Pose directory structure.
 
     Output layout:
-      output_root/images/...\n
-      output_root/labels/...\n
-      output_root/train.txt (optional)
+      output_root/images/...  (only with ``copy_images=True``)
+      output_root/labels/...
+      output_root/<split_name>.txt (optional)
+
+    Labels are placed where ``YOLOPoseDataset`` looks for them: with copied
+    images at ``labels/<mirrored_label_rel_path>`` (``images/train/x.jpg`` ->
+    ``labels/train/x.txt``); with ``copy_images=False`` the split file lists the
+    absolute source image paths and labels are flat, ``labels/<name>.txt``.
+
+    Raises:
+        ValueError: When two images would get the same label file.
     """
     format_impl = FORMAT_REGISTRY.get(format_name)
 
@@ -87,32 +73,51 @@ def convert_registered_format_to_yolo_pose(
     output_root_abs = os.path.abspath(output_root)
     images_root = os.path.join(output_root_abs, "images")
     labels_root = os.path.join(output_root_abs, "labels")
-    os.makedirs(images_root, exist_ok=True)
+    if copy_images:
+        os.makedirs(images_root, exist_ok=True)
     os.makedirs(labels_root, exist_ok=True)
 
     converted_images = 0
     converted_annotations = 0
     skipped_missing_images = 0
+    split_entries: List[str] = []
+    image_by_label_key: Dict[str, str] = {}
 
     for sample in format_impl.iter_samples(input_root_abs):
-        rel_image_path = sample.relative_image_path.replace('\\', '/')
+        rel_image_path = os.path.normpath(sample.relative_image_path.replace('\\', '/')).replace('\\', '/')
         source_image_path = sample.image_path
 
         if not os.path.isfile(source_image_path):
             skipped_missing_images += 1
             continue
 
-        destination_image_path = os.path.join(output_root_abs, rel_image_path)
-        destination_label_path = os.path.join(
-            labels_root,
-            os.path.splitext(rel_image_path)[0] + ".txt",
-        )
+        if os.path.isabs(rel_image_path) or rel_image_path == ".." or rel_image_path.startswith("../"):
+            raise ValueError(
+                f"Image path '{sample.relative_image_path}' leaves the dataset root; cannot convert it."
+            )
 
-        os.makedirs(os.path.dirname(destination_image_path), exist_ok=True)
+        if copy_images:
+            label_rel_path = mirrored_label_rel_path(rel_image_path)
+        else:
+            label_rel_path = os.path.splitext(os.path.basename(rel_image_path))[0] + ".txt"
+        destination_label_path = os.path.join(labels_root, label_rel_path)
+        label_key = os.path.normcase(os.path.abspath(destination_label_path))
+        if label_key in image_by_label_key:
+            raise ValueError(
+                f"Images '{image_by_label_key[label_key]}' and '{rel_image_path}' would share the label "
+                f"file '{destination_label_path}'."
+                + ("" if copy_images else " Use copy_images=True to keep the folder layout.")
+            )
+        image_by_label_key[label_key] = rel_image_path
         os.makedirs(os.path.dirname(destination_label_path), exist_ok=True)
 
         if copy_images:
+            destination_image_path = os.path.join(output_root_abs, rel_image_path)
+            os.makedirs(os.path.dirname(destination_image_path), exist_ok=True)
             shutil.copy2(source_image_path, destination_image_path)
+            split_entries.append(rel_image_path)
+        else:
+            split_entries.append(os.path.abspath(source_image_path).replace('\\', '/'))
 
         lines: List[str] = []
         for ann in sample.annotations:
@@ -126,12 +131,13 @@ def convert_registered_format_to_yolo_pose(
 
     split_path: Optional[str] = None
     if generate_split_file:
-        split_path = generate_train_txt_from_images(
-            dataset_root=output_root_abs,
-            images_dir="images",
-            output_file=os.path.join(output_root_abs, f"{split_name}.txt"),
-            recursive=True,
-        )
+        if not split_entries:
+            raise ValueError(f"No images were converted from: {input_root_abs}")
+        # Written from the converted samples rather than by scanning images/,
+        # so it also works without copies and for paths outside images/.
+        split_path = os.path.join(output_root_abs, f"{split_name}.txt")
+        with open(split_path, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(split_entries) + "\n")
 
     return {
         "format": format_name,
@@ -164,14 +170,50 @@ def convert_coco_keypoints_with_ultralytics(
 
     coco_annotations_dir_abs = os.path.abspath(coco_annotations_dir)
     output_root_abs = os.path.abspath(output_root)
+    labels_dst_abs = os.path.join(output_root_abs, "labels")
 
     os.makedirs(output_root_abs, exist_ok=True)
-    convert_coco(
-        labels_dir=coco_annotations_dir_abs,
-        save_dir=output_root_abs,
-        use_segments=False,
-        use_keypoints=True,
-    )
+
+    # convert_coco renames a save_dir that already exists (X -> X2) and writes
+    # labels to save_dir/labels/<json name>/<file_name>.txt. Convert into a
+    # staging folder that does not exist yet, then move the labels to
+    # output_root/labels/<file_name>.txt so they line up with output_root/images.
+    staging_root = tempfile.mkdtemp(prefix="coco_convert_", dir=output_root_abs)
+    staging_save_dir = os.path.join(staging_root, "converted")
+    source_json_by_label: Dict[str, str] = {}
+    try:
+        convert_coco(
+            labels_dir=coco_annotations_dir_abs,
+            save_dir=staging_save_dir,
+            use_segments=False,
+            use_keypoints=True,
+        )
+        if not os.path.isdir(staging_save_dir):
+            raise RuntimeError(f"Ultralytics convert_coco did not write to {staging_save_dir}")
+
+        staged_labels_root = os.path.join(staging_save_dir, "labels")
+        if os.path.isdir(staged_labels_root):
+            for json_dir_name in sorted(os.listdir(staged_labels_root)):
+                json_labels_dir = os.path.join(staged_labels_root, json_dir_name)
+                if not os.path.isdir(json_labels_dir):
+                    continue
+                for root, _, files in os.walk(json_labels_dir):
+                    for file_name in files:
+                        if not file_name.lower().endswith(".txt"):
+                            continue
+                        src = os.path.join(root, file_name)
+                        dst = os.path.join(labels_dst_abs, os.path.relpath(src, json_labels_dir))
+                        dst_key = os.path.normcase(dst)
+                        if dst_key in source_json_by_label:
+                            raise ValueError(
+                                f"Annotation files '{source_json_by_label[dst_key]}' and '{json_dir_name}' "
+                                f"both label '{os.path.relpath(src, json_labels_dir)}'; convert them separately."
+                            )
+                        source_json_by_label[dst_key] = json_dir_name
+                        os.makedirs(os.path.dirname(dst), exist_ok=True)
+                        os.replace(src, dst)
+    finally:
+        shutil.rmtree(staging_root, ignore_errors=True)
 
     copied_images = 0
     if copy_images_from is not None:
@@ -202,6 +244,7 @@ def convert_coco_keypoints_with_ultralytics(
         "converter": "ultralytics.convert_coco",
         "annotations_dir": coco_annotations_dir_abs,
         "output_root": output_root_abs,
+        "converted_labels": len(source_json_by_label),
         "copied_images": copied_images,
         "split_file": split_path,
     }

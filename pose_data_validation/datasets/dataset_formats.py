@@ -14,6 +14,24 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
+from .yolo_pose_dataset import _candidate_label_paths
+
+
+def bbox_from_keypoints(keypoints: np.ndarray) -> Tuple[float, float, float, float]:
+    """Return a normalized YOLO bbox (cx, cy, w, h) around the visible keypoints.
+
+    Uses all keypoints when none is visible (or there is no visibility column).
+    """
+    keypoints = np.asarray(keypoints, dtype=float)
+    if keypoints.size == 0:
+        return 0.0, 0.0, 0.0, 0.0
+    coords = keypoints[:, :2]
+    if keypoints.shape[1] >= 3 and np.any(keypoints[:, 2] > 0):
+        coords = coords[keypoints[:, 2] > 0]
+    x_min, y_min = (float(value) for value in coords.min(axis=0))
+    x_max, y_max = (float(value) for value in coords.max(axis=0))
+    return (x_min + x_max) / 2.0, (y_min + y_max) / 2.0, max(0.0, x_max - x_min), max(0.0, y_max - y_min)
+
 
 @dataclass
 class KeypointAnnotation:
@@ -83,25 +101,29 @@ class YoloPoseFormat(KeypointDatasetFormat):
         if not os.path.isfile(split_path):
             raise FileNotFoundError(f"Split file not found: {split_path}")
 
-        with open(split_path, "r", encoding="utf-8") as split_handle:
+        with open(split_path, "r", encoding="utf-8-sig") as split_handle:
             for raw_image_rel_path in split_handle:
                 image_rel_path = raw_image_rel_path.strip().replace('\\', '/')
                 if not image_rel_path:
                     continue
 
                 image_path = os.path.abspath(os.path.join(root_abs, image_rel_path))
-                label_rel_path = os.path.splitext(image_rel_path)[0] + ".txt"
-                label_path = os.path.join(root_abs, self.labels_dir, os.path.basename(label_rel_path))
-
-                if not os.path.isfile(label_path):
-                    mirrored_label_path = os.path.join(root_abs, self.labels_dir, label_rel_path)
-                    if os.path.isfile(mirrored_label_path):
-                        label_path = mirrored_label_path
-                    else:
-                        continue
+                # Same lookup as YOLOPoseDataset.
+                label_path = next(
+                    (
+                        candidate
+                        for candidate in _candidate_label_paths(
+                            image_rel_path, os.path.join(root_abs, self.labels_dir), root_abs
+                        )
+                        if os.path.isfile(candidate)
+                    ),
+                    None,
+                )
+                if label_path is None:
+                    continue
 
                 annotations: List[KeypointAnnotation] = []
-                with open(label_path, "r", encoding="utf-8") as label_handle:
+                with open(label_path, "r", encoding="utf-8-sig") as label_handle:
                     for line in label_handle:
                         parsed = self._parse_label_line(line)
                         if parsed is not None:
@@ -123,17 +145,22 @@ class CocoKeypointsFormat(KeypointDatasetFormat):
         self.annotation_file = annotation_file
 
     @staticmethod
-    def _bbox_from_keypoints_xyv(keypoints_xyv: np.ndarray) -> Tuple[float, float, float, float]:
-        visible_mask = keypoints_xyv[:, 2] > 0
-        coords = keypoints_xyv[:, :2][visible_mask] if np.any(visible_mask) else keypoints_xyv[:, :2]
-        if coords.size == 0:
-            return 0.0, 0.0, 0.0, 0.0
-
-        x_min = float(np.min(coords[:, 0]))
-        y_min = float(np.min(coords[:, 1]))
-        x_max = float(np.max(coords[:, 0]))
-        y_max = float(np.max(coords[:, 1]))
-        return (x_min + x_max) / 2.0, (y_min + y_max) / 2.0, max(0.0, x_max - x_min), max(0.0, y_max - y_min)
+    def _bbox_from_coco(
+        bbox_xywh_pixels: Optional[List[float]],
+        width: float,
+        height: float,
+    ) -> Optional[Tuple[float, float, float, float]]:
+        """Convert a COCO [x, y, w, h] pixel box to a normalized YOLO box."""
+        if not bbox_xywh_pixels or len(bbox_xywh_pixels) != 4:
+            return None
+        x, y, box_w, box_h = (float(value) for value in bbox_xywh_pixels)
+        if box_w <= 0 or box_h <= 0:
+            return None
+        x0 = min(max(x / width, 0.0), 1.0)
+        y0 = min(max(y / height, 0.0), 1.0)
+        x1 = min(max((x + box_w) / width, 0.0), 1.0)
+        y1 = min(max((y + box_h) / height, 0.0), 1.0)
+        return (x0 + x1) / 2.0, (y0 + y1) / 2.0, x1 - x0, y1 - y0
 
     def iter_samples(self, input_root: str) -> Iterable[KeypointSample]:
         root_abs = os.path.abspath(input_root)
@@ -152,6 +179,9 @@ class CocoKeypointsFormat(KeypointDatasetFormat):
         grouped_annotations: Dict[int, List[KeypointAnnotation]] = {}
         for ann in coco.get("annotations", []):
             if "keypoints" not in ann:
+                continue
+            # Crowd regions are not individual persons (Ultralytics skips them too).
+            if ann.get("iscrowd", 0):
                 continue
 
             image_id = int(ann["image_id"])
@@ -174,7 +204,9 @@ class CocoKeypointsFormat(KeypointDatasetFormat):
             keypoints_xyv[:, :2] = np.clip(keypoints_xyv[:, :2], 0.0, 1.0)
 
             class_id = class_map.get(int(ann.get("category_id", -1)), 0)
-            bbox = self._bbox_from_keypoints_xyv(keypoints_xyv)
+            bbox = self._bbox_from_coco(ann.get("bbox"), width, height)
+            if bbox is None:
+                bbox = bbox_from_keypoints(keypoints_xyv)
             grouped_annotations.setdefault(image_id, []).append(
                 KeypointAnnotation(class_id=class_id, keypoints=keypoints_xyv, bbox_xywh=bbox)
             )

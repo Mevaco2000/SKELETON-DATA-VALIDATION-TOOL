@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+import itertools
 import os
 import shutil
 import random
 import zipfile
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 from tqdm import tqdm
 
 from ..config import DEFAULT_VAL_RATIO, DEFAULT_RANDOM_SEED
+from ..validation.image_validation import labelled_keypoint_mask
 
 if TYPE_CHECKING:
     from .yolo_pose_dataset import YOLOPoseDataset
@@ -228,26 +230,37 @@ def _apply_angle_preserving_shift(
     min_shift: float,
     rng: np.random.Generator,
 ) -> tuple[np.ndarray, List[int], np.ndarray]:
-    """Shift one contiguous block of keypoints while preserving block geometry."""
+    """Shift one contiguous block of keypoints while preserving block geometry.
+
+    Invisible keypoints are never moved and are never used to define a shift
+    direction.
+    """
     original = np.asarray(keypoints, dtype=float)
     replaced = original.copy()
     coords = replaced[:, :2]
     shift_vectors = np.zeros((len(replaced), 2), dtype=float)
+    visible = labelled_keypoint_mask(original)
 
     total_keypoints = len(coords)
-    if keypoint_count_to_shift <= 0 or total_keypoints == 0:
+    if keypoint_count_to_shift <= 0 or total_keypoints == 0 or not np.any(visible):
         return replaced, [], shift_vectors
+
+    def direction_between(start_index: int, end_index: int) -> Optional[np.ndarray]:
+        if not (visible[start_index] and visible[end_index]):
+            return None
+        direction = coords[end_index] - coords[start_index]
+        return direction if np.any(direction) else None
 
     shift_count = min(keypoint_count_to_shift, total_keypoints)
     block_options = []
 
     if shift_count == total_keypoints:
         if total_keypoints >= 2:
-            prefix_direction = coords[1] - coords[0]
-            suffix_direction = coords[-1] - coords[-2]
-            if np.any(prefix_direction):
+            prefix_direction = direction_between(0, 1)
+            suffix_direction = direction_between(total_keypoints - 2, total_keypoints - 1)
+            if prefix_direction is not None:
                 block_options.append((slice(0, total_keypoints), prefix_direction, max_endpoint_shift))
-            if np.any(suffix_direction):
+            if suffix_direction is not None:
                 block_options.append((slice(0, total_keypoints), suffix_direction, max_endpoint_shift))
         else:
             block_options.append((slice(0, total_keypoints), np.array([1.0, 0.0], dtype=float), max_endpoint_shift))
@@ -255,27 +268,33 @@ def _apply_angle_preserving_shift(
         for block_start in range(0, total_keypoints - shift_count + 1):
             block_end = block_start + shift_count - 1
             block_slice = slice(block_start, block_end + 1)
+            if not np.any(visible[block_slice]):
+                continue
 
             if block_start == 0:
-                direction = coords[block_end + 1] - coords[block_end]
+                direction = direction_between(block_end, block_end + 1)
+                if direction is None:
+                    continue
                 max_shift = max_endpoint_shift if block_end == 0 else float(np.linalg.norm(direction))
-                if np.any(direction) and max_shift > 0.0:
+                if max_shift > 0.0:
                     block_options.append((block_slice, direction, max_shift))
                 continue
 
             if block_end == total_keypoints - 1:
-                direction = coords[block_start] - coords[block_start - 1]
+                direction = direction_between(block_start - 1, block_start)
+                if direction is None:
+                    continue
                 max_shift = max_endpoint_shift if block_start == total_keypoints - 1 else float(np.linalg.norm(direction))
-                if np.any(direction) and max_shift > 0.0:
+                if max_shift > 0.0:
                     block_options.append((block_slice, direction, max_shift))
                 continue
 
-            left_direction = coords[block_start] - coords[block_start - 1]
-            right_direction = coords[block_end + 1] - coords[block_end]
+            left_direction = direction_between(block_start - 1, block_start)
+            right_direction = direction_between(block_end, block_end + 1)
 
-            if np.any(left_direction):
+            if left_direction is not None:
                 block_options.append((block_slice, left_direction, float(np.linalg.norm(left_direction))))
-            if np.any(right_direction):
+            if right_direction is not None:
                 block_options.append((block_slice, right_direction, float(np.linalg.norm(right_direction))))
 
     if not block_options:
@@ -295,6 +314,8 @@ def _apply_angle_preserving_shift(
     applied_shift = unit_direction * shift_distance
     coords[block_slice] += applied_shift
     coords[:, :2] = np.clip(coords[:, :2], 0.0, 1.0)
+    # Invisible keypoints inside the block stay where they were.
+    coords[~visible] = original[~visible, :2]
 
     actual_shift_vectors = coords - original[:, :2]
     shift_vectors[:, :] = actual_shift_vectors
@@ -340,6 +361,26 @@ def _load_yolo_pose_label_entries(label_path: str) -> List[Dict[str, object]]:
             })
 
     return entries
+
+
+def _label_entry_index_for_person(
+    entries: List[Dict[str, object]],
+    person_id: int,
+    label_path: str,
+) -> int:
+    """Return the index in ``entries`` of the label line for ``person_id``.
+
+    ``person_id`` counts only lines that contain keypoints (the numbering used by
+    ``YPImageValidation.load_all_keypoints_from_file``), while ``entries`` also
+    holds lines without keypoints, such as bbox-only objects.
+    """
+    person_counter = -1
+    for entry_index, entry in enumerate(entries):
+        if np.asarray(entry['keypoints']).size > 0:
+            person_counter += 1
+            if person_counter == int(person_id):
+                return entry_index
+    raise IndexError(f"Person {person_id} not found in label file: {label_path}")
 
 
 def _format_yolo_float(value: float) -> str:
@@ -410,6 +451,86 @@ def _copy_data_yaml_for_export(dataset: 'YOLOPoseDataset', output_root: str) -> 
     return destination_data_yaml
 
 
+def _unwrap_dataset(dataset):
+    """Return the YOLOPoseDataset behind a KeypointDatasetAdapter, or the dataset itself.
+
+    In-place operations must update the real dataset object: attributes set on
+    the adapter would not reach the dataset it forwards to.
+    """
+    return dataset.as_yolo_dataset() if hasattr(dataset, "as_yolo_dataset") else dataset
+
+
+def _paths_overlap(path_a: str, path_b: str) -> bool:
+    """Return True when the two paths are equal or one contains the other."""
+    key_a = os.path.normcase(os.path.abspath(path_a)).rstrip(os.sep) + os.sep
+    key_b = os.path.normcase(os.path.abspath(path_b)).rstrip(os.sep) + os.sep
+    return key_a.startswith(key_b) or key_b.startswith(key_a)
+
+
+def _relative_path_inside(path: str, root: str, kind: str) -> str:
+    """Return ``path`` relative to ``root``, refusing paths that leave ``root``.
+
+    Exports copy files to ``output_root/<relative path>``; a path that starts
+    with ``..`` or sits on another drive would be written outside the export.
+    """
+    try:
+        rel_path = os.path.relpath(os.path.abspath(path), os.path.abspath(root))
+    except ValueError as exc:  # different drive on Windows
+        raise ValueError(f"Cannot export {kind} '{path}': it is on a different drive than '{root}'.") from exc
+
+    if os.path.isabs(rel_path) or rel_path == os.pardir or rel_path.startswith(os.pardir + os.sep):
+        raise ValueError(f"Cannot export {kind} '{path}': it is outside '{root}'.")
+    return rel_path
+
+
+def _iter_export_records(
+    dataset: 'YOLOPoseDataset',
+    pairs: Iterable[Tuple[str, str]],
+) -> Iterator[Tuple[str, str, str, str]]:
+    """Yield (image_rel_path, image_path, label_path, label_rel_path) for existing pairs.
+
+    A generator, so callers that need only some records check only those.
+    """
+    for image_path, label_path in pairs:
+        if not os.path.exists(image_path) or not os.path.exists(label_path):
+            continue
+        yield (
+            _relative_path_inside(image_path, dataset.dataset_dir, 'image'),
+            image_path,
+            label_path,
+            _relative_path_inside(label_path, dataset.labels_dir, 'label'),
+        )
+
+
+def _copy_export_records(records: Iterable[Tuple[str, str, str, str]], output_root: str) -> None:
+    """Copy images and labels, keeping their layout under ``output_root``.
+
+    Images keep their path relative to the dataset directory and labels keep
+    their path relative to the labels directory, so ``images/train/a.jpg`` and
+    ``images/val/a.jpg`` keep separate ``labels/train/a.txt`` and
+    ``labels/val/a.txt`` instead of overwriting one flat ``labels/a.txt``.
+    """
+    output_labels_dir = os.path.join(output_root, 'labels')
+    os.makedirs(output_labels_dir, exist_ok=True)
+
+    for image_rel_path, source_image_path, label_path, label_rel_path in records:
+        destination_image_path = os.path.join(output_root, image_rel_path)
+        os.makedirs(os.path.dirname(destination_image_path), exist_ok=True)
+        shutil.copy2(source_image_path, destination_image_path)
+
+        if label_path is None or label_rel_path is None:
+            continue
+        destination_label_path = os.path.join(output_labels_dir, label_rel_path)
+        os.makedirs(os.path.dirname(destination_label_path), exist_ok=True)
+        shutil.copy2(label_path, destination_label_path)
+
+
+def _write_split_file(output_dataset_file: str, image_rel_paths: Iterable[str]) -> None:
+    lines = [str(path).replace('\\', '/') for path in image_rel_paths]
+    with open(output_dataset_file, 'w', encoding='utf-8') as file_handle:
+        file_handle.write("\n".join(lines) + ("\n" if lines else ""))
+
+
 def export_random_dataset_subset(
     dataset: 'YOLOPoseDataset',
     sample_count: int,
@@ -453,18 +574,7 @@ def export_random_dataset_subset(
     candidate_pairs = list(dataset._valid_pairs)
     random.Random(seed).shuffle(candidate_pairs)
 
-    selected_records = []
-    for image_path, label_path in candidate_pairs:
-        if not os.path.exists(image_path) or not os.path.exists(label_path):
-            continue
-
-        rel_path = os.path.relpath(image_path, dataset.dataset_dir)
-        if rel_path is None:
-            raise ValueError(f"Could not resolve relative path for image: {image_path}")
-        selected_records.append((rel_path, image_path, label_path))
-
-        if len(selected_records) == sample_count:
-            break
+    selected_records = list(itertools.islice(_iter_export_records(dataset, candidate_pairs), sample_count))
 
     if len(selected_records) != sample_count:
         raise ValueError(
@@ -473,23 +583,10 @@ def export_random_dataset_subset(
         )
 
     os.makedirs(output_root, exist_ok=True)
-    output_labels_dir = os.path.join(output_root, 'labels')
-    os.makedirs(output_labels_dir, exist_ok=True)
-
-    for image_rel_path, source_image_path, label_path in selected_records:
-        destination_image_path = os.path.join(output_root, image_rel_path)
-        os.makedirs(os.path.dirname(destination_image_path), exist_ok=True)
-        shutil.copy2(source_image_path, destination_image_path)
-
-        destination_label_path = os.path.join(output_labels_dir, os.path.basename(label_path))
-        shutil.copy2(label_path, destination_label_path)
+    _copy_export_records(selected_records, output_root)
 
     output_dataset_file = os.path.join(output_root, os.path.basename(dataset.dataset_file))
-    with open(output_dataset_file, 'w', encoding='utf-8') as file_handle:
-        file_handle.write(
-            "\n".join(image_rel_path for image_rel_path, _, _ in selected_records)
-            + ("\n" if selected_records else "")
-        )
+    _write_split_file(output_dataset_file, (record[0] for record in selected_records))
 
     _copy_data_yaml_for_export(dataset, output_root)
     return output_dataset_file
@@ -530,15 +627,7 @@ def export_dataset_partitions(
     if shuffle:
         random.Random(seed).shuffle(candidate_pairs)
 
-    selected_records = []
-    for image_path, label_path in candidate_pairs:
-        if not os.path.exists(image_path) or not os.path.exists(label_path):
-            continue
-
-        rel_path = os.path.relpath(image_path, dataset.dataset_dir)
-        if rel_path is None:
-            raise ValueError(f"Could not resolve relative path for image: {image_path}")
-        selected_records.append((rel_path, image_path, label_path))
+    selected_records = list(_iter_export_records(dataset, candidate_pairs))
 
     total_records = len(selected_records)
     if total_records == 0:
@@ -570,26 +659,13 @@ def export_dataset_partitions(
 
         part_output_root = os.path.join(output_root, f"part_{part_index}")
         os.makedirs(part_output_root, exist_ok=True)
-        output_labels_dir = os.path.join(part_output_root, 'labels')
-        os.makedirs(output_labels_dir, exist_ok=True)
-
-        for image_rel_path, source_image_path, label_path in part_records:
-            destination_image_path = os.path.join(part_output_root, image_rel_path)
-            os.makedirs(os.path.dirname(destination_image_path), exist_ok=True)
-            shutil.copy2(source_image_path, destination_image_path)
-
-            destination_label_path = os.path.join(output_labels_dir, os.path.basename(label_path))
-            shutil.copy2(label_path, destination_label_path)
+        _copy_export_records(part_records, part_output_root)
 
         output_dataset_file = os.path.join(
             part_output_root,
             os.path.basename(dataset.dataset_file),
         )
-        with open(output_dataset_file, 'w', encoding='utf-8') as file_handle:
-            file_handle.write(
-                "\n".join(image_rel_path for image_rel_path, _, _ in part_records)
-                + ("\n" if part_records else "")
-            )
+        _write_split_file(output_dataset_file, (record[0] for record in part_records))
 
         _copy_data_yaml_for_export(dataset, part_output_root)
         output_split_files.append(output_dataset_file)
@@ -627,45 +703,64 @@ def remove_duplicate_samples_from_dataset(
     """
     if keep not in {'first', 'last'}:
         raise ValueError("keep must be either 'first' or 'last'")
+    dataset = _unwrap_dataset(dataset)
 
+    def identifier_key(value: Any) -> str:
+        # Same normalisation for lookup keys and queried identifiers, so the
+        # comparison is case-insensitive on Windows for every kind of key.
+        return os.path.normcase(os.path.normpath(str(value))).replace('\\', '/')
+
+    def split_line_rel_path(image_rel_path: str) -> str:
+        image_path = os.path.join(dataset.dataset_dir, image_rel_path)
+        try:
+            return os.path.relpath(image_path, dataset.dataset_dir).replace('\\', '/')
+        except ValueError:  # different drive on Windows
+            return os.path.abspath(image_path).replace('\\', '/')
+
+    # Records keyed by a canonical id: the image path relative to the dataset
+    # directory, with forward slashes.
     dataset_records: List[Tuple[str, str, str]] = []
     for image_path, label_path in dataset._valid_pairs:
         if not os.path.exists(image_path) or not os.path.exists(label_path):
             continue
-
-        image_rel_path = os.path.relpath(image_path, dataset.dataset_dir)
-        if image_rel_path is None:
-            raise ValueError(f"Could not resolve relative path for image: {image_path}")
-        dataset_records.append((image_rel_path, image_path, label_path))
+        try:
+            image_rel_path = os.path.relpath(image_path, dataset.dataset_dir)
+        except ValueError:  # different drive on Windows
+            image_rel_path = os.path.abspath(image_path)
+        dataset_records.append((image_rel_path.replace('\\', '/'), image_path, label_path))
 
     order_by_rel_path = {
-        image_rel_path.replace('\\', '/'): index
+        image_rel_path: index
         for index, (image_rel_path, _, _) in enumerate(dataset_records)
     }
     record_by_rel_path = {
-        image_rel_path.replace('\\', '/'): (image_rel_path, image_path, label_path)
+        image_rel_path: (image_rel_path, image_path, label_path)
         for image_rel_path, image_path, label_path in dataset_records
     }
-    record_by_abs_path = {
-        os.path.normcase(os.path.normpath(image_path)).replace('\\', '/'): image_rel_path.replace('\\', '/')
+    rel_path_by_abs_key = {
+        identifier_key(os.path.abspath(image_path)): image_rel_path
         for image_rel_path, image_path, _ in dataset_records
+    }
+    rel_path_by_rel_key = {
+        identifier_key(image_rel_path): image_rel_path
+        for image_rel_path, _, _ in dataset_records
     }
 
     basename_to_rel_paths: Dict[str, List[str]] = {}
     for image_rel_path, _, _ in dataset_records:
-        normalized_rel_path = image_rel_path.replace('\\', '/')
-        basename_to_rel_paths.setdefault(os.path.basename(normalized_rel_path), []).append(normalized_rel_path)
+        basename_key = os.path.basename(identifier_key(image_rel_path))
+        basename_to_rel_paths.setdefault(basename_key, []).append(image_rel_path)
 
     def resolve_duplicate_identifier(identifier: Any) -> Optional[str]:
         if identifier is None:
             return None
 
-        normalized_identifier = os.path.normcase(os.path.normpath(str(identifier))).replace('\\', '/')
-        if normalized_identifier in record_by_abs_path:
-            return record_by_abs_path[normalized_identifier]
+        normalized_identifier = identifier_key(identifier)
+        if normalized_identifier in rel_path_by_abs_key:
+            return rel_path_by_abs_key[normalized_identifier]
 
-        if normalized_identifier in record_by_rel_path:
-            return normalized_identifier
+        if normalized_identifier in rel_path_by_rel_key:
+            return rel_path_by_rel_key[normalized_identifier]
 
         basename = os.path.basename(normalized_identifier)
         basename_matches = basename_to_rel_paths.get(basename, [])
@@ -755,47 +850,58 @@ def remove_duplicate_samples_from_dataset(
         )
 
     cleaned_records = [
-        record_by_rel_path[image_rel_path.replace('\\', '/')]
+        record_by_rel_path[image_rel_path]
         for image_rel_path, _, _ in dataset_records
-        if image_rel_path.replace('\\', '/') in kept_rel_paths
+        if image_rel_path in kept_rel_paths
+    ]
+
+    # Keep every split entry that is not a removed duplicate, including entries
+    # outside _valid_pairs (background images with empty labels, unreadable
+    # images, ...). Only duplicates may disappear from the split.
+    removed_keys = {identifier_key(rel_path) for rel_path in removed_rel_paths}
+    kept_split_lines = [
+        line
+        for line in dataset.image_rel_paths
+        if identifier_key(split_line_rel_path(line)) not in removed_keys
     ]
 
     if output_dataset_path is None:
-        with open(dataset.dataset_file, 'w', encoding='utf-8') as file_handle:
-            file_handle.write(
-                "\n".join(image_rel_path for image_rel_path, _, _ in cleaned_records)
-                + ("\n" if cleaned_records else "")
-            )
+        _write_split_file(dataset.dataset_file, kept_split_lines)
 
-        dataset.image_rel_paths = [image_rel_path for image_rel_path, _, _ in cleaned_records]
+        dataset.image_rel_paths = kept_split_lines
         dataset._valid_pairs = dataset._validate_pairs()
         output_dataset_file = dataset.dataset_file
         output_mode = 'in_place_split_rewrite'
     else:
+        from .yolo_pose_dataset import _candidate_label_paths
+
         output_root = os.path.abspath(output_dataset_path)
         if os.path.exists(output_root) and os.listdir(output_root):
             raise FileExistsError(
                 f"Output dataset path already exists and is not empty: {output_root}"
             )
 
+        export_records = []
+        for line in kept_split_lines:
+            source_image_path = os.path.abspath(os.path.join(dataset.dataset_dir, line))
+            if not os.path.exists(source_image_path):
+                continue
+            label_path = next(
+                (candidate for candidate in _candidate_label_paths(line, dataset.labels_dir, dataset.dataset_dir) if os.path.exists(candidate)),
+                None,
+            )
+            export_records.append((
+                _relative_path_inside(source_image_path, dataset.dataset_dir, 'image'),
+                source_image_path,
+                label_path,
+                _relative_path_inside(label_path, dataset.labels_dir, 'label') if label_path else None,
+            ))
+
         os.makedirs(output_root, exist_ok=True)
-        output_labels_dir = os.path.join(output_root, 'labels')
-        os.makedirs(output_labels_dir, exist_ok=True)
-
-        for image_rel_path, source_image_path, label_path in cleaned_records:
-            destination_image_path = os.path.join(output_root, image_rel_path)
-            os.makedirs(os.path.dirname(destination_image_path), exist_ok=True)
-            shutil.copy2(source_image_path, destination_image_path)
-
-            destination_label_path = os.path.join(output_labels_dir, os.path.basename(label_path))
-            shutil.copy2(label_path, destination_label_path)
+        _copy_export_records(export_records, output_root)
 
         output_dataset_file = os.path.join(output_root, os.path.basename(dataset.dataset_file))
-        with open(output_dataset_file, 'w', encoding='utf-8') as file_handle:
-            file_handle.write(
-                "\n".join(image_rel_path for image_rel_path, _, _ in cleaned_records)
-                + ("\n" if cleaned_records else "")
-            )
+        _write_split_file(output_dataset_file, (record[0] for record in export_records))
 
         _copy_data_yaml_for_export(dataset, output_root)
         output_mode = 'export_clean_copy'
@@ -837,6 +943,7 @@ def remove_samples_by_image_paths(
     """
     from .yolo_pose_dataset import _candidate_label_paths
 
+    dataset = _unwrap_dataset(dataset)
     requested_absolute_paths: Set[str] = set()
     requested_relative_paths: Set[str] = set()
 
@@ -878,7 +985,7 @@ def remove_samples_by_image_paths(
             continue
 
         label_path = None
-        for candidate_label_path in _candidate_label_paths(rel_path, dataset.labels_dir):
+        for candidate_label_path in _candidate_label_paths(rel_path, dataset.labels_dir, dataset.dataset_dir):
             if os.path.exists(candidate_label_path):
                 label_path = candidate_label_path
                 break
@@ -968,7 +1075,12 @@ def _persist_replacement_dataset(
     label_entries_cache: Dict[str, List[Dict[str, object]]],
     output_dataset_path: Optional[str],
 ) -> None:
-    """Write modified labels either in place or into a copied dataset."""
+    """Write modified labels either in place or into a copied dataset.
+
+    The copy keeps the source layout: each image keeps its path relative to the
+    dataset directory and each label keeps its path relative to the labels
+    directory, so the copy resolves labels exactly like the source.
+    """
     if output_dataset_path is None:
         for label_path, entries in label_entries_cache.items():
             _write_yolo_pose_label_entries(label_path, entries)
@@ -976,27 +1088,39 @@ def _persist_replacement_dataset(
 
     output_root = os.path.abspath(output_dataset_path)
     output_labels_dir = os.path.join(output_root, 'labels')
+
+    def same_path(path_a: str, path_b: str) -> bool:
+        return os.path.normcase(os.path.abspath(path_a)) == os.path.normcase(os.path.abspath(path_b))
+
+    # The copy writes images to output_root/<rel> and labels to output_root/labels/<rel>;
+    # either one landing on the source would overwrite it.
+    if same_path(output_root, dataset.dataset_dir) or same_path(output_labels_dir, dataset.labels_dir):
+        raise ValueError(
+            "output_dataset_path would write over the source images or labels. "
+            "Pass output_dataset_path=None to modify labels in place."
+        )
     os.makedirs(output_labels_dir, exist_ok=True)
 
+    exported_rel_paths: List[str] = []
     for image_rel_path in dataset.image_rel_paths:
-        source_image_path = os.path.join(dataset.dataset_dir, image_rel_path)
+        source_image_path = os.path.abspath(os.path.join(dataset.dataset_dir, image_rel_path))
         if not os.path.exists(source_image_path):
             continue
-        destination_image_path = os.path.join(output_root, image_rel_path)
+        safe_rel_path = _relative_path_inside(source_image_path, dataset.dataset_dir, 'image')
+        destination_image_path = os.path.join(output_root, safe_rel_path)
         os.makedirs(os.path.dirname(destination_image_path), exist_ok=True)
         shutil.copy2(source_image_path, destination_image_path)
+        exported_rel_paths.append(safe_rel_path)
 
-    output_dataset_file = os.path.join(output_root, os.path.basename(dataset.dataset_file))
-    os.makedirs(os.path.dirname(output_dataset_file), exist_ok=True)
-    with open(output_dataset_file, 'w', encoding='utf-8') as file_handle:
-        file_handle.write("\n".join(dataset.image_rel_paths) + ("\n" if dataset.image_rel_paths else ""))
+    _write_split_file(os.path.join(output_root, os.path.basename(dataset.dataset_file)), exported_rel_paths)
 
-    source_label_paths = dataset.get_all_label_paths()
-    for source_label_path in source_label_paths:
+    for source_label_path in dataset.get_all_label_paths():
         entries = label_entries_cache.get(source_label_path)
         if entries is None:
             entries = _load_yolo_pose_label_entries(source_label_path)
-        destination_label_path = os.path.join(output_labels_dir, os.path.basename(source_label_path))
+        label_rel_path = _relative_path_inside(source_label_path, dataset.labels_dir, 'label')
+        destination_label_path = os.path.join(output_labels_dir, label_rel_path)
+        os.makedirs(os.path.dirname(destination_label_path), exist_ok=True)
         _write_yolo_pose_label_entries(destination_label_path, entries)
 
     _copy_data_yaml_for_export(dataset, output_root)
@@ -1006,39 +1130,107 @@ def _build_person_records(dataset: 'YOLOPoseDataset') -> List[Dict[str, object]]
     """Collect per-person records from a YOLOPoseDataset."""
     all_persons: List[Dict[str, object]] = []
     for sample in dataset:
-        image_rel_path = os.path.relpath(sample['image_path'], dataset.dataset_dir)
-        label_name = os.path.basename(sample['label_path'])
         for person_id, person_keypoints in enumerate(sample['all_keypoints']):
             person_keypoints_array = np.asarray(person_keypoints, dtype=float)
             all_persons.append({
                 'image_path': sample['image_path'],
-                'image_rel_path': image_rel_path,
                 'label_path': sample['label_path'],
-                'label_name': label_name,
                 'person_id': person_id,
                 'keypoints': person_keypoints_array,
             })
     return all_persons
 
 
-def _compute_yolo_bbox_from_keypoints(keypoints: np.ndarray) -> List[float]:
-    """Compute YOLO bbox [cx, cy, w, h] from normalized keypoints."""
-    keypoints_array = np.asarray(keypoints, dtype=float)
-    if keypoints_array.size == 0:
-        return [0.0, 0.0, 0.0, 0.0]
+def _replacement_result_paths(
+    dataset: 'YOLOPoseDataset',
+    source_person: Dict[str, object],
+    output_dataset_path: Optional[str],
+) -> Tuple[str, str]:
+    """Return the (image, label) paths where a modified person will end up."""
+    if output_dataset_path is None:
+        return str(source_person['image_path']), str(source_person['label_path'])
 
-    coords = np.clip(keypoints_array[:, :2], 0.0, 1.0)
-    x_min = float(np.min(coords[:, 0]))
-    y_min = float(np.min(coords[:, 1]))
-    x_max = float(np.max(coords[:, 0]))
-    y_max = float(np.max(coords[:, 1]))
+    output_root = os.path.abspath(output_dataset_path)
+    image_rel_path = _relative_path_inside(str(source_person['image_path']), dataset.dataset_dir, 'image')
+    label_rel_path = _relative_path_inside(str(source_person['label_path']), dataset.labels_dir, 'label')
+    return (
+        os.path.join(output_root, image_rel_path),
+        os.path.join(output_root, 'labels', label_rel_path),
+    )
+
+
+def _updated_yolo_bbox(
+    original_bbox: Sequence[float],
+    original_keypoints: np.ndarray,
+    replaced_keypoints: np.ndarray,
+) -> List[float]:
+    """Return the YOLO bbox [cx, cy, w, h] for modified keypoints.
+
+    Only visible keypoints are used. The original box is returned unchanged when
+    no visible keypoint moved. Otherwise the box follows the moved keypoints and
+    keeps the margins the original box had around the original keypoints.
+    """
+    original_bbox = [float(value) for value in original_bbox]
+    original_array = np.asarray(original_keypoints, dtype=float)
+    replaced_array = np.asarray(replaced_keypoints, dtype=float)
+    if original_array.ndim != 2 or original_array.shape != replaced_array.shape:
+        return original_bbox
+
+    visible = labelled_keypoint_mask(original_array)
+    if not np.any(visible):
+        return original_bbox
+
+    old_coords = original_array[visible, :2]
+    new_coords = np.clip(replaced_array[visible, :2], 0.0, 1.0)
+    if np.allclose(old_coords, new_coords):
+        return original_bbox
+
+    center_x, center_y, width, height = original_bbox
+    box_x0, box_x1 = center_x - width / 2.0, center_x + width / 2.0
+    box_y0, box_y1 = center_y - height / 2.0, center_y + height / 2.0
+
+    margin_left = max(0.0, float(old_coords[:, 0].min()) - box_x0)
+    margin_right = max(0.0, box_x1 - float(old_coords[:, 0].max()))
+    margin_top = max(0.0, float(old_coords[:, 1].min()) - box_y0)
+    margin_bottom = max(0.0, box_y1 - float(old_coords[:, 1].max()))
+
+    x0 = max(0.0, float(new_coords[:, 0].min()) - margin_left)
+    x1 = min(1.0, float(new_coords[:, 0].max()) + margin_right)
+    y0 = max(0.0, float(new_coords[:, 1].min()) - margin_top)
+    y1 = min(1.0, float(new_coords[:, 1].max()) + margin_bottom)
 
     return [
-        (x_min + x_max) / 2.0,
-        (y_min + y_max) / 2.0,
-        max(0.0, x_max - x_min),
-        max(0.0, y_max - y_min),
+        (x0 + x1) / 2.0,
+        (y0 + y1) / 2.0,
+        max(0.0, x1 - x0),
+        max(0.0, y1 - y0),
     ]
+
+
+def _apply_label_replacement(
+    label_entries_cache: Dict[str, List[Dict[str, object]]],
+    source_person: Dict[str, object],
+    replaced_keypoints: np.ndarray,
+) -> None:
+    """Store modified keypoints (and the matching bbox) in the label cache."""
+    label_path = str(source_person['label_path'])
+    if label_path not in label_entries_cache:
+        label_entries_cache[label_path] = _load_yolo_pose_label_entries(label_path)
+
+    entries = label_entries_cache[label_path]
+    entry = entries[_label_entry_index_for_person(entries, int(source_person['person_id']), label_path)]
+    entry['bbox'] = _updated_yolo_bbox(entry['bbox'], entry['keypoints'], replaced_keypoints)
+    entry['keypoints'] = np.asarray(replaced_keypoints, dtype=float).copy()
+
+
+def _require_replacement_count(replaced_count: int, sample_count: int) -> None:
+    """Raise when fewer persons than requested could actually be modified."""
+    if replaced_count < sample_count:
+        raise ValueError(
+            f"Only {replaced_count} of {sample_count} persons could be modified "
+            "(the others have too few visible keypoints or no shift fits in the frame). "
+            "Lower sample_count or relax the shift parameters. No labels were written."
+        )
 
 
 def _build_translation_vector(max_translation_distance: float, rng: np.random.Generator) -> np.ndarray:
@@ -1072,14 +1264,24 @@ def _apply_rigid_transform(
     rng: np.random.Generator,
     max_attempts: int = 50,
 ) -> tuple[np.ndarray, np.ndarray, float]:
-    """Apply translation, rotation, or both while keeping keypoints inside frame."""
+    """Apply translation, rotation, or both while keeping keypoints inside frame.
+
+    Only visible keypoints are transformed, checked against the frame and used
+    for the rotation centre; invisible ``(0, 0)`` keypoints stay unchanged.
+    When no transform fits after ``max_attempts``, the keypoints are returned
+    unchanged with a zero transform.
+    """
     mode = str(transform_mode).lower()
     allowed_modes = {"translate", "rotate", "both"}
     if mode not in allowed_modes:
         raise ValueError(f"transform_mode must be one of {sorted(allowed_modes)}")
 
     original = np.asarray(keypoints, dtype=float)
-    coords = original[:, :2]
+    visible = labelled_keypoint_mask(original)
+    if not np.any(visible):
+        return original.copy(), np.zeros(2, dtype=float), 0.0
+
+    coords = original[visible, :2]
     center = coords.mean(axis=0)
 
     translation_scale = 1.0
@@ -1107,7 +1309,7 @@ def _apply_rigid_transform(
 
         if np.all((transformed_coords >= 0.0) & (transformed_coords <= 1.0)):
             replaced = original.copy()
-            replaced[:, :2] = transformed_coords
+            replaced[visible, :2] = transformed_coords
             return replaced, translation_vector, rotation_angle_degrees
 
         translation_scale *= 0.8
@@ -1149,18 +1351,21 @@ def _apply_axis_aligned_keypoint_shift(
     rng: np.random.Generator,
     max_attempts: int = 50,
 ) -> tuple[np.ndarray, List[int], np.ndarray]:
-    """Shift a random subset of keypoints along axes while staying in frame."""
+    """Shift a random subset of visible keypoints along axes while staying in frame."""
     original = np.asarray(keypoints, dtype=float)
     replaced = original.copy()
+    shift_vectors = np.zeros((len(original), 2), dtype=float)
 
-    max_indices_to_shift = min(max_keypoints_to_shift, len(original))
+    visible_indices = np.flatnonzero(labelled_keypoint_mask(original))
+    if len(visible_indices) == 0 or max_keypoints_to_shift <= 0:
+        return replaced, [], shift_vectors
+
+    max_indices_to_shift = min(max_keypoints_to_shift, len(visible_indices))
     selected_count = int(rng.integers(1, max_indices_to_shift + 1))
     selected_indices = sorted(
         int(index)
-        for index in rng.choice(len(original), size=selected_count, replace=False)
+        for index in rng.choice(visible_indices, size=selected_count, replace=False)
     )
-
-    shift_vectors = np.zeros((len(original), 2), dtype=float)
 
     for keypoint_index in selected_indices:
         coords = replaced[keypoint_index, :2].copy()
@@ -1190,6 +1395,70 @@ def _apply_axis_aligned_keypoint_shift(
     return replaced, changed_keypoint_indices, shift_vectors
 
 
+def _replace_selected_persons(
+    dataset: Union[str, 'YOLOPoseDataset'],
+    labels_dir: Optional[str],
+    sample_count: int,
+    seed: Optional[int],
+    output_dataset_path: Optional[str],
+    min_keypoints: int,
+    result_cls: type,
+    modify,
+) -> list:
+    """Shared driver of the ``replace_*_keypoints`` functions.
+
+    Visits persons in random order and calls ``modify(original_keypoints, rng)``,
+    which returns ``None`` to skip the person or ``(replaced_keypoints, fields)``
+    with the extra ``result_cls`` fields. Stops after ``sample_count`` modified
+    persons, then writes the labels in place or into ``output_dataset_path``.
+    """
+    from .yolo_pose_dataset import YOLOPoseDataset
+
+    yolo_dataset = dataset if isinstance(dataset, YOLOPoseDataset) else YOLOPoseDataset(dataset, labels_dir=labels_dir)
+    rng = np.random.default_rng(seed)
+
+    all_persons = [
+        person_record
+        for person_record in _build_person_records(yolo_dataset)
+        if person_record['keypoints'].ndim == 2 and len(person_record['keypoints']) >= min_keypoints
+    ]
+    if not all_persons:
+        raise ValueError(f"Dataset does not contain any person with at least {min_keypoints} keypoint(s)")
+    if sample_count > len(all_persons):
+        raise ValueError(f"sample_count={sample_count} exceeds available persons={len(all_persons)}")
+
+    label_entries_cache: Dict[str, List[Dict[str, object]]] = {}
+    replacements = []
+    for person_index in rng.permutation(len(all_persons)):
+        if len(replacements) == sample_count:
+            break
+
+        source_person = all_persons[int(person_index)]
+        original_keypoints = source_person['keypoints'].copy()
+        outcome = modify(original_keypoints, rng)
+        if outcome is None:
+            continue
+        replaced_keypoints, fields = outcome
+
+        _apply_label_replacement(label_entries_cache, source_person, replaced_keypoints)
+        image_path, label_path = _replacement_result_paths(yolo_dataset, source_person, output_dataset_path)
+        replacements.append(result_cls(
+            image_path=image_path,
+            label_path=label_path,
+            person_id=source_person['person_id'],
+            original_keypoints=original_keypoints,
+            replaced_keypoints=replaced_keypoints,
+            **fields,
+        ))
+
+    _require_replacement_count(len(replacements), sample_count)
+    _persist_replacement_dataset(yolo_dataset, label_entries_cache, output_dataset_path)
+
+    if isinstance(dataset, YOLOPoseDataset) and output_dataset_path is None:
+        dataset._valid_pairs = dataset._validate_pairs()
+    return replacements
+
+
 def replace_angle_preserving_keypoints(
     dataset: Union[str, 'YOLOPoseDataset'],
     sample_count: int,
@@ -1207,7 +1476,9 @@ def replace_angle_preserving_keypoints(
     ``max_keypoints_to_shift`` keypoints are moved in each replaced annotation,
     capped by the number of available keypoints. The move is applied to one
     contiguous block, which preserves the relative geometry inside that shifted
-    block. The dataset size does not increase.
+    block. Invisible keypoints are never moved. Persons for which no shift is
+    possible are skipped and another person is drawn instead. The dataset size
+    does not increase.
 
     Args:
         dataset: Either a ``YOLOPoseDataset`` instance or a path to ``data.yaml``
@@ -1229,10 +1500,9 @@ def replace_angle_preserving_keypoints(
         replaced keypoints, original angles, replaced angles, and shifted indices.
 
     Raises:
-        ValueError: If the dataset has no valid persons or input parameters are invalid.
+        ValueError: If the dataset has no valid persons, input parameters are
+            invalid, or fewer than ``sample_count`` persons could be modified.
     """
-    from .yolo_pose_dataset import YOLOPoseDataset
-
     if sample_count <= 0:
         raise ValueError("sample_count must be > 0")
     if max_keypoints_to_shift <= 0:
@@ -1242,84 +1512,27 @@ def replace_angle_preserving_keypoints(
     if min_shift < 0:
         raise ValueError("min_shift must be >= 0")
 
-    if isinstance(dataset, YOLOPoseDataset):
-        yolo_dataset = dataset
-    else:
-        yolo_dataset = YOLOPoseDataset(dataset, labels_dir=labels_dir)
-
-    rng = np.random.default_rng(seed)
-
-    all_persons = [
-        person_record
-        for person_record in _build_person_records(yolo_dataset)
-        if person_record['keypoints'].ndim == 2 and len(person_record['keypoints']) >= 2
-    ]
-
-    if not all_persons:
-        raise ValueError("Dataset does not contain any person with at least 2 keypoints")
-
-    if sample_count > len(all_persons):
-        raise ValueError(
-            f"sample_count={sample_count} exceeds available persons={len(all_persons)}"
-        )
-
-    selected_person_indices = rng.choice(len(all_persons), size=sample_count, replace=False)
-    label_entries_cache: Dict[str, List[Dict[str, object]]] = {}
-    replacements: List[AnglePreservingKeypointReplacement] = []
-
-    for selected_person_index in selected_person_indices:
-        source_person = all_persons[int(selected_person_index)]
-        original_keypoints = source_person['keypoints'].copy()
-        exact_shift_count = min(max_keypoints_to_shift, len(original_keypoints))
-
+    def modify(original_keypoints, rng):
         replaced_keypoints, changed_keypoint_indices, shift_vectors = _apply_angle_preserving_shift(
             original_keypoints,
-            keypoint_count_to_shift=exact_shift_count,
+            keypoint_count_to_shift=min(max_keypoints_to_shift, len(original_keypoints)),
             max_endpoint_shift=max_endpoint_shift,
             min_shift=min_shift,
             rng=rng,
         )
+        if not changed_keypoint_indices:
+            return None
+        return replaced_keypoints, {
+            'original_angles': _compute_segment_angles(original_keypoints),
+            'replaced_angles': _compute_segment_angles(replaced_keypoints),
+            'changed_keypoint_indices': changed_keypoint_indices,
+            'shift_vectors': shift_vectors,
+        }
 
-        label_path = source_person['label_path']
-        if label_path not in label_entries_cache:
-            label_entries_cache[label_path] = _load_yolo_pose_label_entries(label_path)
-
-        label_entries_cache[label_path][source_person['person_id']]['keypoints'] = replaced_keypoints.copy()
-        label_entries_cache[label_path][source_person['person_id']]['bbox'] = _compute_yolo_bbox_from_keypoints(
-            replaced_keypoints
-        )
-
-        result_image_path = source_person['image_path']
-        result_label_path = label_path
-        if output_dataset_path is not None:
-            output_root = os.path.abspath(output_dataset_path)
-            result_image_path = os.path.join(output_root, source_person['image_rel_path'])
-            result_label_path = os.path.join(output_root, 'labels', source_person['label_name'])
-
-        replacements.append(
-            AnglePreservingKeypointReplacement(
-                image_path=result_image_path,
-                label_path=result_label_path,
-                person_id=source_person['person_id'],
-                original_keypoints=original_keypoints,
-                replaced_keypoints=replaced_keypoints,
-                original_angles=_compute_segment_angles(original_keypoints),
-                replaced_angles=_compute_segment_angles(replaced_keypoints),
-                changed_keypoint_indices=changed_keypoint_indices,
-                shift_vectors=shift_vectors,
-            )
-        )
-
-    _persist_replacement_dataset(
-        yolo_dataset,
-        label_entries_cache=label_entries_cache,
-        output_dataset_path=output_dataset_path,
+    return _replace_selected_persons(
+        dataset, labels_dir, sample_count, seed, output_dataset_path,
+        min_keypoints=2, result_cls=AnglePreservingKeypointReplacement, modify=modify,
     )
-
-    if isinstance(dataset, YOLOPoseDataset) and output_dataset_path is None:
-        dataset._valid_pairs = dataset._validate_pairs()
-
-    return replacements
 
 
 def replace_rigid_keypoints(
@@ -1334,10 +1547,11 @@ def replace_rigid_keypoints(
 ) -> List[RigidKeypointReplacement]:
     """Replace existing person annotations using a rigid transform in place.
 
-    Applies translation, rotation, or both to all keypoints of selected persons.
-    The relative geometry of the skeleton is preserved because the transform is
-    rigid for the whole point set. Modified label files are rewritten in place and
-    the dataset size does not change.
+    Applies translation, rotation, or both to all visible keypoints of selected
+    persons. The relative geometry of the skeleton is preserved because the
+    transform is rigid for the whole point set. Persons for which no transform
+    fits in the frame are skipped and another person is drawn instead. Modified
+    label files are rewritten in place and the dataset size does not change.
 
     Args:
         dataset: Either a ``YOLOPoseDataset`` instance or a path to ``data.yaml``
@@ -1353,9 +1567,11 @@ def replace_rigid_keypoints(
 
     Returns:
         List of rigid replacement results with ``image_path`` and ``person_id``.
-    """
-    from .yolo_pose_dataset import YOLOPoseDataset
 
+    Raises:
+        ValueError: If parameters are invalid or fewer than ``sample_count``
+            persons could be modified.
+    """
     if sample_count <= 0:
         raise ValueError("sample_count must be > 0")
     if max_rotation_degrees < 0:
@@ -1365,34 +1581,7 @@ def replace_rigid_keypoints(
     if max_rotation_degrees == 0 and max_translation_distance == 0:
         raise ValueError("At least one of max_rotation_degrees or max_translation_distance must be > 0")
 
-    if isinstance(dataset, YOLOPoseDataset):
-        yolo_dataset = dataset
-    else:
-        yolo_dataset = YOLOPoseDataset(dataset, labels_dir=labels_dir)
-
-    rng = np.random.default_rng(seed)
-
-    all_persons = [
-        person_record
-        for person_record in _build_person_records(yolo_dataset)
-        if person_record['keypoints'].ndim == 2 and len(person_record['keypoints']) >= 2
-    ]
-
-    if not all_persons:
-        raise ValueError("Dataset does not contain any person with at least 2 keypoints")
-
-    if sample_count > len(all_persons):
-        raise ValueError(
-            f"sample_count={sample_count} exceeds available persons={len(all_persons)}"
-        )
-
-    selected_person_indices = rng.choice(len(all_persons), size=sample_count, replace=False)
-    label_entries_cache: Dict[str, List[Dict[str, object]]] = {}
-    replacements: List[RigidKeypointReplacement] = []
-
-    for selected_person_index in selected_person_indices:
-        source_person = all_persons[int(selected_person_index)]
-        original_keypoints = source_person['keypoints'].copy()
+    def modify(original_keypoints, rng):
         replaced_keypoints, translation_vector, rotation_angle_degrees = _apply_rigid_transform(
             original_keypoints,
             max_rotation_degrees=max_rotation_degrees,
@@ -1400,46 +1589,18 @@ def replace_rigid_keypoints(
             transform_mode=transform_mode,
             rng=rng,
         )
+        if np.allclose(original_keypoints[:, :2], replaced_keypoints[:, :2]):
+            return None
+        return replaced_keypoints, {
+            'translation_vector': translation_vector,
+            'rotation_angle_degrees': rotation_angle_degrees,
+            'transform_mode': str(transform_mode).lower(),
+        }
 
-        label_path = source_person['label_path']
-        if label_path not in label_entries_cache:
-            label_entries_cache[label_path] = _load_yolo_pose_label_entries(label_path)
-
-        label_entries_cache[label_path][source_person['person_id']]['keypoints'] = replaced_keypoints.copy()
-        label_entries_cache[label_path][source_person['person_id']]['bbox'] = _compute_yolo_bbox_from_keypoints(
-            replaced_keypoints
-        )
-
-        result_image_path = source_person['image_path']
-        result_label_path = label_path
-        if output_dataset_path is not None:
-            output_root = os.path.abspath(output_dataset_path)
-            result_image_path = os.path.join(output_root, source_person['image_rel_path'])
-            result_label_path = os.path.join(output_root, 'labels', source_person['label_name'])
-
-        replacements.append(
-            RigidKeypointReplacement(
-                image_path=result_image_path,
-                label_path=result_label_path,
-                person_id=source_person['person_id'],
-                original_keypoints=original_keypoints,
-                replaced_keypoints=replaced_keypoints,
-                translation_vector=translation_vector,
-                rotation_angle_degrees=rotation_angle_degrees,
-                transform_mode=str(transform_mode).lower(),
-            )
-        )
-
-    _persist_replacement_dataset(
-        yolo_dataset,
-        label_entries_cache=label_entries_cache,
-        output_dataset_path=output_dataset_path,
+    return _replace_selected_persons(
+        dataset, labels_dir, sample_count, seed, output_dataset_path,
+        min_keypoints=2, result_cls=RigidKeypointReplacement, modify=modify,
     )
-
-    if isinstance(dataset, YOLOPoseDataset) and output_dataset_path is None:
-        dataset._valid_pairs = dataset._validate_pairs()
-
-    return replacements
 
 
 def replace_axis_aligned_keypoints(
@@ -1455,9 +1616,10 @@ def replace_axis_aligned_keypoints(
     """Replace existing person annotations by shifting random keypoints along axes.
 
     Selects existing persons without replacement and modifies only a random subset
-    of their keypoints. Each modified keypoint is shifted left/right, up/down, or
-    in both axes depending on ``direction_mode``. Label files are rewritten in
-    place and the dataset size does not change.
+    of their visible keypoints. Each modified keypoint is shifted left/right,
+    up/down, or in both axes depending on ``direction_mode``. Persons for which
+    no keypoint could be moved are skipped and another person is drawn instead.
+    Label files are rewritten in place and the dataset size does not change.
 
     Args:
         dataset: Either a ``YOLOPoseDataset`` instance or a path to ``data.yaml``
@@ -1473,46 +1635,19 @@ def replace_axis_aligned_keypoints(
 
     Returns:
         List of axis-aligned replacement results with ``image_path`` and ``person_id``.
-    """
-    from .yolo_pose_dataset import YOLOPoseDataset
 
+    Raises:
+        ValueError: If parameters are invalid or fewer than ``sample_count``
+            persons could be modified.
+    """
     if sample_count <= 0:
         raise ValueError("sample_count must be > 0")
     if max_keypoints_to_shift <= 0:
         raise ValueError("max_keypoints_to_shift must be > 0")
-    if max_shift_distance < 0:
-        raise ValueError("max_shift_distance must be >= 0")
-    if max_shift_distance == 0:
+    if max_shift_distance <= 0:
         raise ValueError("max_shift_distance must be > 0")
 
-    if isinstance(dataset, YOLOPoseDataset):
-        yolo_dataset = dataset
-    else:
-        yolo_dataset = YOLOPoseDataset(dataset, labels_dir=labels_dir)
-
-    rng = np.random.default_rng(seed)
-
-    all_persons = [
-        person_record
-        for person_record in _build_person_records(yolo_dataset)
-        if person_record['keypoints'].ndim == 2 and len(person_record['keypoints']) >= 1
-    ]
-
-    if not all_persons:
-        raise ValueError("Dataset does not contain any person annotations")
-
-    if sample_count > len(all_persons):
-        raise ValueError(
-            f"sample_count={sample_count} exceeds available persons={len(all_persons)}"
-        )
-
-    selected_person_indices = rng.choice(len(all_persons), size=sample_count, replace=False)
-    label_entries_cache: Dict[str, List[Dict[str, object]]] = {}
-    replacements: List[AxisAlignedKeypointReplacement] = []
-
-    for selected_person_index in selected_person_indices:
-        source_person = all_persons[int(selected_person_index)]
-        original_keypoints = source_person['keypoints'].copy()
+    def modify(original_keypoints, rng):
         replaced_keypoints, changed_keypoint_indices, shift_vectors = _apply_axis_aligned_keypoint_shift(
             original_keypoints,
             max_keypoints_to_shift=max_keypoints_to_shift,
@@ -1520,46 +1655,18 @@ def replace_axis_aligned_keypoints(
             direction_mode=direction_mode,
             rng=rng,
         )
+        if not changed_keypoint_indices:
+            return None
+        return replaced_keypoints, {
+            'changed_keypoint_indices': changed_keypoint_indices,
+            'shift_vectors': shift_vectors,
+            'direction_mode': str(direction_mode).lower(),
+        }
 
-        label_path = source_person['label_path']
-        if label_path not in label_entries_cache:
-            label_entries_cache[label_path] = _load_yolo_pose_label_entries(label_path)
-
-        label_entries_cache[label_path][source_person['person_id']]['keypoints'] = replaced_keypoints.copy()
-        label_entries_cache[label_path][source_person['person_id']]['bbox'] = _compute_yolo_bbox_from_keypoints(
-            replaced_keypoints
-        )
-
-        result_image_path = source_person['image_path']
-        result_label_path = label_path
-        if output_dataset_path is not None:
-            output_root = os.path.abspath(output_dataset_path)
-            result_image_path = os.path.join(output_root, source_person['image_rel_path'])
-            result_label_path = os.path.join(output_root, 'labels', source_person['label_name'])
-
-        replacements.append(
-            AxisAlignedKeypointReplacement(
-                image_path=result_image_path,
-                label_path=result_label_path,
-                person_id=source_person['person_id'],
-                original_keypoints=original_keypoints,
-                replaced_keypoints=replaced_keypoints,
-                changed_keypoint_indices=changed_keypoint_indices,
-                shift_vectors=shift_vectors,
-                direction_mode=str(direction_mode).lower(),
-            )
-        )
-
-    _persist_replacement_dataset(
-        yolo_dataset,
-        label_entries_cache=label_entries_cache,
-        output_dataset_path=output_dataset_path,
+    return _replace_selected_persons(
+        dataset, labels_dir, sample_count, seed, output_dataset_path,
+        min_keypoints=1, result_cls=AxisAlignedKeypointReplacement, modify=modify,
     )
-
-    if isinstance(dataset, YOLOPoseDataset) and output_dataset_path is None:
-        dataset._valid_pairs = dataset._validate_pairs()
-
-    return replacements
 
 
 def flatten_cvat_yolo_pose(
@@ -1576,6 +1683,8 @@ def flatten_cvat_yolo_pose(
         output_root: Root directory for flattened output
         copy_data_yaml: Whether to copy data.yaml file
     """
+    from .yolo_pose_dataset import ultralytics_label_path
+
     os.makedirs(output_root, exist_ok=True)
 
     out_images = os.path.join(output_root, "images")
@@ -1584,13 +1693,33 @@ def flatten_cvat_yolo_pose(
     os.makedirs(out_images, exist_ok=True)
     os.makedirs(out_labels, exist_ok=True)
 
-    label_index = {}
+    # Split lists such as train.txt are not label files.
+    split_list_stems = {"train", "val", "valid", "test"}
+    labels_by_stem: Dict[str, List[str]] = {}
 
     for root, _, files in os.walk(input_root):
         for file in files:
             if file.lower().endswith(".txt"):
                 name = os.path.splitext(file)[0]
-                label_index[name] = os.path.join(root, file)
+                if name.lower() in split_list_stems:
+                    continue
+                labels_by_stem.setdefault(name, []).append(os.path.join(root, file))
+
+    def find_label(image_dir: str, stem: str) -> Optional[str]:
+        # 1) CVAT YOLO 1.1: label next to the image.
+        same_dir_label = os.path.join(image_dir, stem + ".txt")
+        if os.path.isfile(same_dir_label):
+            return same_dir_label
+
+        # 2) Ultralytics layout: .../images/<sub>/x.jpg -> .../labels/<sub>/x.txt
+        mirrored_label = ultralytics_label_path(os.path.join(image_dir, stem + ".jpg"))
+        if mirrored_label and os.path.isfile(mirrored_label):
+            return mirrored_label
+
+        # 3) Anywhere else, but only when the stem is unambiguous: CVAT task
+        #    exports reuse names like frame_000000 in every task folder.
+        matches = labels_by_stem.get(stem, [])
+        return matches[0] if len(matches) == 1 else None
 
     train_lines = []
     existing_names = set()
@@ -1617,15 +1746,16 @@ def flatten_cvat_yolo_pose(
 
         shutil.copy(img_src, os.path.join(out_images, new_name))
 
-        if name in label_index:
+        label_src = find_label(root, name)
+        if label_src is not None:
             shutil.copy(
-                label_index[name],
+                label_src,
                 os.path.join(out_labels, os.path.splitext(new_name)[0] + ".txt")
             )
 
         train_lines.append(f"images/{new_name}\n")
 
-    with open(os.path.join(output_root, "train.txt"), "w") as f:
+    with open(os.path.join(output_root, "train.txt"), "w", encoding="utf-8") as f:
         f.writelines(train_lines)
 
     if copy_data_yaml:
@@ -1669,8 +1799,8 @@ def merge_yolo_pose_datasets(
         labels_path = os.path.join(dataset_root, "labels")
         train_txt_path = os.path.join(dataset_root, "train.txt")
 
-        with open(train_txt_path, "r") as f:
-            lines = f.readlines()
+        with open(train_txt_path, "r", encoding="utf-8-sig") as f:
+            lines = [line for line in f.readlines() if line.strip()]
 
         for line in tqdm(lines, desc=f"Merging {prefix}", leave=False):
             img_rel_path = line.strip()
@@ -1704,7 +1834,7 @@ def merge_yolo_pose_datasets(
     process_dataset(dataset1_root, "ds1")
     process_dataset(dataset2_root, "ds2")
 
-    with open(os.path.join(output_root, "train.txt"), "w") as f:
+    with open(os.path.join(output_root, "train.txt"), "w", encoding="utf-8") as f:
         f.writelines(merged_train_lines)
 
     data_yaml_1 = os.path.join(dataset1_root, "data.yaml")
@@ -1734,6 +1864,16 @@ def split_yolo_pose_dataset(
 
     images_root = os.path.join(dataset_root, "images")
     labels_root = os.path.join(dataset_root, "labels")
+
+    if not os.path.isdir(images_root):
+        raise FileNotFoundError(f"Images directory not found: {images_root}")
+
+    # output_root is deleted below, so it must not overlap the source images or labels.
+    if _paths_overlap(output_root, images_root) or _paths_overlap(output_root, labels_root):
+        raise ValueError(
+            f"output_root '{output_root}' overlaps the source images or labels; "
+            "it would be deleted before the split. Choose a separate output directory."
+        )
 
     if os.path.exists(output_root):
         shutil.rmtree(output_root)
@@ -1793,10 +1933,10 @@ def split_yolo_pose_dataset(
     train_lines = copy_files(train_files, out_images_train, out_labels_train)
     val_lines = copy_files(val_files, out_images_val, out_labels_val)
 
-    with open(os.path.join(output_root, "train.txt"), "w") as f:
+    with open(os.path.join(output_root, "train.txt"), "w", encoding="utf-8") as f:
         f.writelines(train_lines)
 
-    with open(os.path.join(output_root, "val.txt"), "w") as f:
+    with open(os.path.join(output_root, "val.txt"), "w", encoding="utf-8") as f:
         f.writelines(val_lines)
 
     data_yaml_src = os.path.join(dataset_root, "data.yaml")
@@ -1805,7 +1945,7 @@ def split_yolo_pose_dataset(
     yaml_content = ""
 
     if os.path.exists(data_yaml_src):
-        with open(data_yaml_src, "r") as f:
+        with open(data_yaml_src, "r", encoding="utf-8-sig") as f:
             yaml_content = f.read()
 
     lines = yaml_content.splitlines()
@@ -1821,7 +1961,7 @@ def split_yolo_pose_dataset(
     cleaned_lines.insert(1, "train: images/train")
     cleaned_lines.insert(2, "val: images/val")
 
-    with open(data_yaml_dst, "w") as f:
+    with open(data_yaml_dst, "w", encoding="utf-8") as f:
         f.write("\n".join(cleaned_lines) + "\n")
 
 
@@ -1830,7 +1970,10 @@ def convert_yolo_pose_to_cvat(
     output_zip_dir: str
 ) -> None:
     """Convert YOLO pose dataset to CVAT format with ZIP archives.
-    
+
+    The source dataset is not modified: the CVAT-specific ``train.txt`` and the
+    nested ``labels/train/images`` copies exist only inside the archives.
+
     Args:
         dataset_root: Root directory of YOLO dataset
         output_zip_dir: Directory for output ZIP files
@@ -1842,35 +1985,21 @@ def convert_yolo_pose_to_cvat(
     train_txt_path = os.path.join(dataset_root, "train.txt")
     data_yaml_path = os.path.join(dataset_root, "data.yaml")
 
-    nested_images_dir = os.path.join(labels_root, "train", "images")
-    os.makedirs(nested_images_dir, exist_ok=True)
-
-    # Copy images to nested structure
     image_files = [
         f for f in os.listdir(images_root)
         if f.lower().endswith((".jpg", ".jpeg", ".png"))
     ]
 
-    for img_name in tqdm(image_files, desc="Copying images to nested structure"):
-        shutil.copy(
-            os.path.join(images_root, img_name),
-            os.path.join(nested_images_dir, img_name)
-        )
-
-    # Update train.txt
     if not os.path.exists(train_txt_path):
         raise FileNotFoundError("train.txt not found")
 
-    with open(train_txt_path, "r") as f:
-        lines = f.readlines()
+    with open(train_txt_path, "r", encoding="utf-8-sig") as f:
+        lines = [line for line in f.readlines() if line.strip()]
 
     updated_lines = []
     for line in lines:
-        filename = os.path.basename(line.strip())
+        filename = os.path.basename(line.strip().replace("\\", "/"))
         updated_lines.append(f"data/images/train/{filename}\n")
-
-    with open(train_txt_path, "w") as f:
-        f.writelines(updated_lines)
 
     # ZIP images
     images_zip_path = os.path.join(output_zip_dir, "images.zip")
@@ -1886,11 +2015,21 @@ def convert_yolo_pose_to_cvat(
     annotations_zip_path = os.path.join(output_zip_dir, "annotations.zip")
 
     with zipfile.ZipFile(annotations_zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+        # Images nested under labels/train/images (archive only).
+        written_arcnames = set()
+        for img_name in tqdm(image_files, desc="Zipping nested images", leave=False):
+            arcname = f"labels/train/images/{img_name}"
+            zipf.write(os.path.join(images_root, img_name), arcname)
+            written_arcnames.add(arcname)
+
         # Labels
         for root, _, files in os.walk(labels_root):
             for file in tqdm(files, desc="Zipping labels", leave=False):
                 full_path = os.path.join(root, file)
-                rel_path = os.path.relpath(full_path, dataset_root)
+                rel_path = os.path.relpath(full_path, dataset_root).replace(os.sep, "/")
+                # Already added above when the source contains labels/train/images.
+                if rel_path in written_arcnames:
+                    continue
                 zipf.write(full_path, rel_path)
 
         # data.yaml
@@ -1900,11 +2039,8 @@ def convert_yolo_pose_to_cvat(
                 os.path.relpath(data_yaml_path, dataset_root)
             )
 
-        # train.txt
-        zipf.write(
-            train_txt_path,
-            os.path.relpath(train_txt_path, dataset_root)
-        )
+        # train.txt with CVAT paths, written straight into the archive.
+        zipf.writestr("train.txt", "".join(updated_lines))
 
 
 def extract_image_subset(
@@ -1942,7 +2078,6 @@ def extract_image_subset(
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    # Get sorted list of images
     image_files = sorted([
         f for f in os.listdir(images_path)
         if f.lower().endswith((".jpg", ".jpeg", ".png"))
@@ -2136,7 +2271,6 @@ def flatten_split_yolo_pose(
             if dest_name in placed_image_names:
                 dest_name = f"{split}__{file_name}"
 
-            # Copy or move image
             dest_image_path = os.path.join(dest_images_root, dest_name)
             if copy_only:
                 shutil.copy2(src_image, dest_image_path)

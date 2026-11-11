@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-from utils.validation import (
+from pose_data_validation.validation import (
     MergedRankingEvaluator,
     YPImageValidation,
     YPSetValidation,
@@ -63,7 +63,7 @@ def _iter_notebook_code_lines(notebook_path: Path):
 
 
 def _parse_imported_symbols(line: str) -> list[str]:
-    match = re.search(r"^\s*from\s+utils\.validation\s+import\s+(.+)$", line.strip())
+    match = re.search(r"^\s*from\s+pose_data_validation\.validation\s+import\s+(.+)$", line.strip())
     if not match:
         return []
 
@@ -284,7 +284,7 @@ def test_scores_notebooks_validation_api_contract() -> None:
     missing_notebooks = [name for name in SCORES_NOTEBOOKS if not (NOTEBOOKS_DIR / name).exists()]
     _assert(not missing_notebooks, f"Missing notebooks: {missing_notebooks}")
 
-    exported_symbols = set(__import__("utils.validation", fromlist=["__all__"]).__all__)
+    exported_symbols = set(__import__("pose_data_validation.validation", fromlist=["__all__"]).__all__)
 
     expected_yp_set_methods = {
         "train_distance_models",
@@ -314,7 +314,7 @@ def test_scores_notebooks_validation_api_contract() -> None:
 
         for line in all_lines:
             _assert(
-                "utils.validation.weryfikacje" not in line,
+                "pose_data_validation.validation.weryfikacje" not in line,
                 f"Notebook {notebook_name} uses removed path: {line.strip()}",
             )
 
@@ -324,7 +324,7 @@ def test_scores_notebooks_validation_api_contract() -> None:
         for symbol in imported_from_validation:
             _assert(
                 symbol in exported_symbols,
-                f"Notebook {notebook_name} imports unknown symbol from utils.validation: {symbol}",
+                f"Notebook {notebook_name} imports unknown symbol from pose_data_validation.validation: {symbol}",
             )
 
         joined_source = "\n".join(all_lines)

@@ -31,36 +31,58 @@ def _first_person_keypoints(all_keypoints: List[np.ndarray]) -> np.ndarray:
     return all_keypoints[0] if all_keypoints else np.array([])
 
 
-def _candidate_label_paths(image_rel_path: str, labels_dir: str) -> List[str]:
-    """Return likely label paths for an image relative path.
+def mirrored_label_rel_path(image_rel_path: str) -> str:
+    """Return the label path, relative to ``labels/``, for an image path relative to the dataset.
 
-    Supports both flat ``labels/<name>.txt`` datasets and mirrored layouts like
-    ``images/train/foo.jpg`` -> ``labels/train/foo.txt``.
+    A leading ``images`` folder is dropped, anything else is kept, so distinct
+    images never share a label: ``images/train/a.jpg`` -> ``train/a.txt``,
+    ``seq1/images/a.jpg`` -> ``seq1/images/a.txt``. Converters write labels
+    with this rule and ``_candidate_label_paths`` reads them with it.
     """
-    normalized_rel_path = image_rel_path.replace('\\', '/')
-    rel_path_without_ext = os.path.splitext(normalized_rel_path)[0]
-    rel_parts = [part for part in rel_path_without_ext.split('/') if part]
+    parts = [part for part in image_rel_path.replace('\\', '/').split('/') if part and part != '.']
+    if len(parts) > 1 and parts[0].lower() == 'images':
+        parts = parts[1:]
+    return os.path.join(*parts[:-1], os.path.splitext(parts[-1])[0] + '.txt')
 
+
+def ultralytics_label_path(image_path: str) -> Optional[str]:
+    """Return the Ultralytics label path: the last ``images`` folder replaced by ``labels``.
+
+    ``.../data/images/train/a.jpg`` -> ``.../data/labels/train/a.txt``; ``None``
+    when the path has no ``images`` folder.
+    """
+    dir_parts = os.path.normpath(os.path.dirname(image_path)).split(os.sep)
+    lowered_parts = [part.lower() for part in dir_parts]
+    if 'images' not in lowered_parts:
+        return None
+    dir_parts[len(lowered_parts) - 1 - lowered_parts[::-1].index('images')] = 'labels'
+    stem = os.path.splitext(os.path.basename(image_path))[0]
+    return os.path.join(os.sep.join(dir_parts), stem + '.txt')
+
+
+def _candidate_label_paths(image_rel_path: str, labels_dir: str, dataset_dir: Optional[str] = None) -> List[str]:
+    """Return likely label paths for an image path from a split file, in lookup order.
+
+    1. flat ``labels/<name>.txt``;
+    2. ``labels/<mirrored_label_rel_path>`` (relative image paths only);
+    3. the Ultralytics location next to the image (needs ``dataset_dir`` for
+       relative image paths).
+    """
     candidate_paths = [
-        os.path.join(labels_dir, os.path.basename(rel_path_without_ext) + '.txt'),
+        os.path.join(labels_dir, os.path.splitext(os.path.basename(image_rel_path.replace('\\', '/')))[0] + '.txt'),
     ]
-
-    if rel_parts:
-        mirrored_parts = rel_parts[1:] if rel_parts[0].lower() == 'images' else rel_parts
-        if mirrored_parts:
-            candidate_paths.append(os.path.join(labels_dir, *mirrored_parts) + '.txt')
+    if os.path.isabs(image_rel_path):
+        image_path = image_rel_path
+    else:
+        candidate_paths.append(os.path.join(labels_dir, mirrored_label_rel_path(image_rel_path)))
+        image_path = os.path.join(dataset_dir, image_rel_path) if dataset_dir else None
+    if image_path:
+        ultralytics_path = ultralytics_label_path(image_path)
+        if ultralytics_path:
+            candidate_paths.append(ultralytics_path)
 
     # Preserve order while removing duplicates.
-    seen_paths = set()
-    unique_paths = []
-    for candidate_path in candidate_paths:
-        normalized_path = os.path.abspath(candidate_path)
-        if normalized_path in seen_paths:
-            continue
-        seen_paths.add(normalized_path)
-        unique_paths.append(normalized_path)
-
-    return unique_paths
+    return list(dict.fromkeys(os.path.abspath(path) for path in candidate_paths))
 
 
 class YOLOPoseImage:
@@ -87,7 +109,7 @@ class YOLOPoseImage:
         >>> cv2.imshow("Image", img.image)
     
     Example 2 - With feature extraction:
-        >>> from utils.validation import YPImageValidation
+        >>> from pose_data_validation.validation import YPImageValidation
         >>> yolo_img = YOLOPoseImage("image.jpg", "image.txt")
         >>> validator = YPImageValidation(yolo_img.image, yolo_img.keypoints)
         >>> decimals = validator.compute_lbp_decimals(patch_size=5)
@@ -117,7 +139,6 @@ class YOLOPoseImage:
             FileNotFoundError: If image or label file doesn't exist
             ValueError: If image cannot be loaded
         """
-        # Load image
         if isinstance(image_path, str):
             self.image_path = os.path.abspath(image_path)
             if not os.path.exists(self.image_path):
@@ -132,7 +153,6 @@ class YOLOPoseImage:
             self.image_path = None
             self.image_name = None
         
-        # Load keypoints
         if label_path is None:
             if self.image_path is None:
                 raise ValueError("label_path required when image_path is numpy array")
@@ -148,8 +168,13 @@ class YOLOPoseImage:
             if os.path.basename(image_root).lower() == 'images':
                 dataset_root = os.path.dirname(image_root)
                 image_rel_path = os.path.relpath(self.image_path, dataset_root)
-                label_candidates = _candidate_label_paths(image_rel_path, os.path.join(dataset_root, 'labels'))
-                label_path = label_candidates[0]
+                label_candidates = _candidate_label_paths(
+                    image_rel_path, os.path.join(dataset_root, 'labels'), dataset_root
+                )
+                label_path = next(
+                    (candidate for candidate in label_candidates if os.path.exists(candidate)),
+                    label_candidates[0],
+                )
             else:
                 img_name = os.path.splitext(self.image_name)[0]
                 label_path = os.path.join(image_dir, '..', 'labels', img_name + '.txt')
@@ -161,7 +186,6 @@ class YOLOPoseImage:
         self.label_name = os.path.basename(self.label_path)
         self.keypoint_format = keypoint_format
         
-        # Load keypoints from label file
         self._load_keypoints(include_visibility)
     
     @classmethod
@@ -366,18 +390,18 @@ class YOLOPoseDataset:
         ...     image_path = sample['image_path']
     
     Example 2 - Get LBP features (use YPSetValidation):
-        >>> from github.utils.validation import YPSetValidation
+        >>> from pose_data_validation.validation import YPSetValidation
         >>> validator = YPSetValidation(dataset)
         >>> decimals, counts, paths = validator.get_all_lbp_decimals(patch_size=7)
     
     Example 3 - Single image features (use YPImageValidation):
-        >>> from github.utils.validation import YPImageValidation
+        >>> from pose_data_validation.validation import YPImageValidation
         >>> sample = dataset[0]
         >>> validator = YPImageValidation(sample['image'], sample['keypoints'])
         >>> decimals = validator.compute_lbp_decimals(patch_size=5)
     
     Example 4 - Use YOLOPoseImage for per-image operations:
-        >>> from utils.datasets import YOLOPoseImage
+        >>> from pose_data_validation.datasets import YOLOPoseImage
         >>> yolo_img = YOLOPoseImage("image.jpg", "image.txt")
         >>> print(f"Keypoints: {yolo_img.keypoints.shape}")
     """
@@ -402,18 +426,16 @@ class YOLOPoseDataset:
             self.dataset_file = dataset_file_abs
             self.dataset_dir = os.path.dirname(self.dataset_file)
         
-        # Infer labels directory
         if labels_dir is None:
             self.labels_dir = os.path.join(self.dataset_dir, "labels")
         else:
             self.labels_dir = os.path.abspath(labels_dir)
         self.keypoint_format = keypoint_format
         
-        # Load image paths from train.txt
-        with open(self.dataset_file, "r") as f:
+        # utf-8-sig: every writer in this package uses UTF-8; also tolerate a BOM.
+        with open(self.dataset_file, "r", encoding="utf-8-sig") as f:
             self.image_rel_paths = [line.strip() for line in f.readlines() if line.strip()]
         
-        # Filter to valid image/label pairs
         self._valid_pairs = self._validate_pairs()
     
     @staticmethod
@@ -433,7 +455,7 @@ class YOLOPoseDataset:
         except ImportError:
             raise ImportError("PyYAML required for data.yaml support. Install: pip install pyyaml")
         
-        with open(data_yaml_path, 'r') as f:
+        with open(data_yaml_path, 'r', encoding='utf-8-sig') as f:
             data_config = yaml.safe_load(f)
         
         # Get dataset root path from data.yaml
@@ -540,7 +562,7 @@ class YOLOPoseDataset:
                 continue
 
             label_path = None
-            for candidate_label_path in _candidate_label_paths(rel_path, self.labels_dir):
+            for candidate_label_path in _candidate_label_paths(rel_path, self.labels_dir, self.dataset_dir):
                 if os.path.exists(candidate_label_path):
                     label_path = candidate_label_path
                     break
@@ -582,7 +604,6 @@ class YOLOPoseDataset:
         for _, label_path in self._valid_pairs:
             try:
                 from ..validation.image_validation import YPImageValidation
-                # Load ALL persons from this label file (not just the first one)
                 all_kpts = YPImageValidation.load_all_keypoints_from_file(
                     label_path,
                     include_visibility=True,
@@ -752,7 +773,6 @@ class YOLOPoseDataset:
         
         for image_path, label_path in self._valid_pairs:
             try:
-                # Load image and keypoints
                 image = cv2.imread(image_path)
                 all_keypoints = YPImageValidation.load_all_keypoints_from_file(
                     label_path,

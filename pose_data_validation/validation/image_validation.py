@@ -86,6 +86,21 @@ def _parse_yolo_pose_label_line(
     return _parse_yolo_keypoint_values(values, include_visibility, keypoint_format)
 
 
+def labelled_keypoint_mask(keypoints: np.ndarray) -> np.ndarray:
+    """Return a boolean mask of keypoints that carry a labelled position.
+
+    YOLO pose labels store unlabelled keypoints as ``(0, 0)`` / ``(0, 0, 0)`` or
+    with visibility 0; such points have no position to move, draw or compare.
+    """
+    keypoints = np.asarray(keypoints, dtype=float)
+    if keypoints.ndim != 2 or keypoints.shape[0] == 0:
+        return np.zeros(len(keypoints), dtype=bool)
+    labelled = ~np.all(np.isclose(keypoints[:, :2], 0.0), axis=1)
+    if keypoints.shape[1] >= 3:
+        labelled &= keypoints[:, 2] > 0
+    return labelled
+
+
 def normalize_distance_connections(
     distance_connections: Optional[Sequence[Tuple[int, int]]]
 ) -> Optional[List[Tuple[int, int]]]:
@@ -135,7 +150,7 @@ class YPImageValidation:
     USAGE PATTERNS:
     
     Example 1 - Compute LBP for a single image:
-        >>> from github.utils.validation import YPImageValidation
+        >>> from pose_data_validation.validation import YPImageValidation
         >>> import cv2
         >>> 
         >>> image = cv2.imread('image.jpg')
@@ -163,13 +178,11 @@ class YPImageValidation:
             keypoints: Array of keypoints with shape (N, 2) with [x, y] OR (N, 3) with [x, y, visibility].
                       If (N, 3), visibility is checked when filtering keypoints.
         """
-        # Load image if path provided
         if isinstance(image, str):
             image = cv2.imread(image)
             if image is None:
                 raise ValueError(f"Could not load image from {image}")
         
-        # Convert to grayscale if needed
         if len(image.shape) == 3:
             image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         
@@ -184,8 +197,8 @@ class YPImageValidation:
         # Denormalize keypoints to pixel coordinates for LBP (needs real image pixels).
         # Check only x, y columns (columns 0-1), not visibility if present
         if self.keypoints.size > 0 and self.keypoints[:, :2].max() <= 1.0:
-            self.keypoints[:, 0] *= self.w  # Denormalize x coordinate
-            self.keypoints[:, 1] *= self.h  # Denormalize y coordinate
+            self.keypoints[:, 0] *= self.w
+            self.keypoints[:, 1] *= self.h
     
     def sequential_distances(
         self,
@@ -667,13 +680,14 @@ class YPImageValidation:
         
         Args:
             image: Image as numpy array (H x W or H x W x 3)
-            keypoints: Array of keypoints (N, 2) with normalized [x, y] coordinates
+            keypoints: Array of keypoints (N, 2) or (N, 3). Coordinates may be
+                normalized (all values <= 1) or already in pixels.
             color: RGB color tuple (R, G, B) in range [0, 255]
             keypoint_size: Radius of drawn keypoints in pixels.
-        
+
         Returns:
             Image with keypoints drawn
-            
+
         Example:
             >>> result = YPImageValidation.draw_keypoints_on_image(
             ...     image, keypoints, color=(0, 255, 0), keypoint_size=4
@@ -681,15 +695,31 @@ class YPImageValidation:
         """
         result = image.copy()
         h, w = image.shape[:2]
-        
+
         if len(result.shape) == 2:
             result = cv2.cvtColor(result, cv2.COLOR_GRAY2BGR)
-        
-        for (x, y) in keypoints[:, :2]:
-            px = int(x * w)
-            py = int(y * h)
+
+        for px, py in YPImageValidation._drawable_pixel_coords(keypoints, w, h):
             cv2.circle(result, (px, py), keypoint_size, color, -1)
         return result
+
+    @staticmethod
+    def _drawable_pixel_coords(keypoints: np.ndarray, width: int, height: int) -> List[Tuple[int, int]]:
+        """Return pixel coordinates of labelled keypoints.
+
+        Same normalization rule as ``__init__``: coordinates are scaled to
+        pixels only when all of them are <= 1. Unlabelled ``(0, 0)`` keypoints
+        and keypoints with visibility 0 are skipped.
+        """
+        keypoints = np.asarray(keypoints, dtype=float)
+        if keypoints.size == 0:
+            return []
+        coords = keypoints[:, :2].copy()
+        if coords.max() <= 1.0:
+            coords[:, 0] *= width
+            coords[:, 1] *= height
+        labelled = labelled_keypoint_mask(keypoints)
+        return [(int(x), int(y)) for (x, y), keep in zip(coords, labelled) if keep]
     
     def draw_keypoints_with_patches(self, patch_size: int = 32,
                                     keypoint_color: tuple = (0, 255, 0),
@@ -722,17 +752,13 @@ class YPImageValidation:
             result = cv2.cvtColor(result, cv2.COLOR_GRAY2BGR)
         
         half_patch = patch_size // 2
-        
-        for (x, y) in self.keypoints[:, :2]:
-            px = int(x * self.w)
-            py = int(y * self.h)
-            
-            # Draw patch rectangle
+
+        # self.keypoints is already in pixels (see __init__).
+        for px, py in self._drawable_pixel_coords(self.keypoints, self.w, self.h):
             top_left = (max(0, px - half_patch), max(0, py - half_patch))
             bottom_right = (min(self.w, px + half_patch), min(self.h, py + half_patch))
             cv2.rectangle(result, top_left, bottom_right, patch_color, thickness)
             
-            # Draw keypoint circle
             cv2.circle(result, (px, py), 4, keypoint_color, -1)
         
         return result
@@ -768,7 +794,7 @@ class YPImageValidation:
         if not os.path.exists(label_path):
             raise FileNotFoundError(f"Label file not found: {label_path}")
         
-        with open(label_path, 'r') as f:
+        with open(label_path, 'r', encoding='utf-8-sig') as f:
             line = f.readline().strip()
         
         if not line:
@@ -809,7 +835,7 @@ class YPImageValidation:
             raise FileNotFoundError(f"Label file not found: {label_path}")
         
         all_keypoints = []
-        with open(label_path, 'r') as f:
+        with open(label_path, 'r', encoding='utf-8-sig') as f:
             for line in f:
                 line = line.strip()
                 if not line:

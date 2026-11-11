@@ -2,6 +2,7 @@
 
 import ast
 import os
+import re
 from collections.abc import Mapping
 from collections import Counter
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -40,6 +41,7 @@ class MergedRankingEvaluator:
         self.segmentation_score_threshold = float(segmentation_score_threshold)
         self.segmentation_mask_tolerance_px = int(segmentation_mask_tolerance_px)
         self._prepared = False
+        self._prepared_components = set()
 
     @staticmethod
     def _is_segmentation_disabled(segmentation_model_name: Optional[str]) -> bool:
@@ -52,59 +54,6 @@ class MergedRankingEvaluator:
         if self._is_segmentation_disabled(self.segmentation_model_name):
             return None
         return str(self.segmentation_model_name)
-
-    def _is_segmentation_cache_compatible(self, cached_masks):
-        if self._is_segmentation_disabled(self.segmentation_model_name):
-            return False
-        if not isinstance(cached_masks, dict):
-            return False
-        cached_model = cached_masks.get("model_name")
-        cached_target_name = cached_masks.get("target_class_name")
-        cached_target_id = cached_masks.get("target_class_id")
-        cached_score = cached_masks.get("score_threshold")
-
-        if cached_model is None:
-            return False
-        if str(cached_model) != str(self._resolved_segmentation_model_name()):
-            return False
-
-        target = self.segmentation_target_class
-        if isinstance(target, str):
-            if cached_target_name is None:
-                return False
-            if str(cached_target_name).strip().lower() != str(target).strip().lower():
-                return False
-        else:
-            try:
-                if cached_target_id is None or int(cached_target_id) != int(target):
-                    return False
-            except Exception:
-                return False
-
-        if cached_score is None:
-            return False
-        try:
-            if abs(float(cached_score) - float(self.segmentation_score_threshold)) > 1e-9:
-                return False
-        except Exception:
-            return False
-
-        return True
-
-    def _is_outside_cache_compatible(self, cached_outside_keypoints):
-        if not isinstance(cached_outside_keypoints, dict):
-            return False
-
-        cached_tolerance = cached_outside_keypoints.get("mask_tolerance_px")
-        if cached_tolerance is None:
-            # Backward compatibility: old caches had no marker and were produced
-            # with the historical default tolerance.
-            cached_tolerance = 12
-
-        try:
-            return int(cached_tolerance) == int(self.segmentation_mask_tolerance_px)
-        except Exception:
-            return False
 
     def _load_reference_report_entries(self):
         loaded = {name: parse_results_txt(path) for name, path in self.report_paths.items()}
@@ -268,57 +217,23 @@ class MergedRankingEvaluator:
 
     def _compare_reference_entries_to_anomalies(self, reference_entries, ranked_source):
         ranked_entries = self._normalize_ranked_entries(ranked_source)
+        _, matches = YPValidation_Test._match_reference_entries(reference_entries, ranked_entries, self.top_k)
 
-        candidate_has_person_ids = ranked_entries and all(
-            YPValidation_Test._extract_person_identifier(entry) is not None for entry in ranked_entries
-        )
-        reference_has_person_ids = reference_entries and all(
-            YPValidation_Test._extract_person_identifier(entry) is not None for entry in reference_entries
-        )
-        match_mode = "image_path_person_id" if candidate_has_person_ids and reference_has_person_ids else "image_path"
+        def matched_ranks(position):
+            return [
+                int(match_tuple[position]["rank"])
+                for match_tuple in matches
+                if match_tuple[position] is not None and match_tuple[position].get("rank") is not None
+            ]
 
-        ranked_entries_sorted = sorted(ranked_entries, key=lambda entry: entry.get("rank", float("inf")))
-        top_entries = ranked_entries_sorted[: self.top_k]
-
-        report_entries_by_identifier = {}
-        top_entries_by_identifier = {}
-
-        for entry in ranked_entries_sorted:
-            identifier = YPValidation_Test._distance_anomaly_entry_identifier(entry, match_mode)
-            report_entries_by_identifier.setdefault(identifier, []).append(entry)
-
-        for entry in top_entries:
-            identifier = YPValidation_Test._distance_anomaly_entry_identifier(entry, match_mode)
-            top_entries_by_identifier.setdefault(identifier, []).append(entry)
-
-        matched_top_ranks = []
-        matched_overall_ranks = []
-
-        for reference_entry in reference_entries:
-            identifier = YPValidation_Test._distance_anomaly_entry_identifier(reference_entry, match_mode)
-            report_bucket = report_entries_by_identifier.get(identifier, [])
-            top_bucket = top_entries_by_identifier.get(identifier, [])
-
-            report_match = report_bucket.pop(0) if report_bucket else None
-            top_match = top_bucket.pop(0) if top_bucket else None
-
-            if report_match is not None and report_match.get("rank") is not None:
-                matched_overall_ranks.append(int(report_match["rank"]))
-            if top_match is not None and top_match.get("rank") is not None:
-                matched_top_ranks.append(int(top_match["rank"]))
-
-        matched_top_count = len(matched_top_ranks)
-        matched_overall_count = len(matched_overall_ranks)
-        avg_rank_all_reference = (
-            sum(matched_overall_ranks) / matched_overall_count if matched_overall_count else None
-        )
-
+        overall_ranks = matched_ranks(1)
+        top_ranks = matched_ranks(2)
         return {
-            "matched_top_k_count": matched_top_count,
+            "matched_top_k_count": len(top_ranks),
             "total_reference_entries": len(reference_entries),
-            "matched_overall_count": matched_overall_count,
-            "avg_rank_all_reference": avg_rank_all_reference,
-            "last_matched_rank_in_top_k": max(matched_top_ranks) if matched_top_ranks else None,
+            "matched_overall_count": len(overall_ranks),
+            "avg_rank_all_reference": sum(overall_ranks) / len(overall_ranks) if overall_ranks else None,
+            "last_matched_rank_in_top_k": max(top_ranks) if top_ranks else None,
         }
 
     def _summarize_comparison(self, comparison):
@@ -330,108 +245,47 @@ class MergedRankingEvaluator:
             f"avg_rank_all={avg_rank_text}"
         )
 
-    def _prepare(self, include_distance: bool = True, include_lbp: bool = True, include_segmentation: bool = True):
-        if self._prepared:
-            return
+    def _set_segmentation_disabled_results(self):
+        self.segmentation_masks = {
+            "masks": [],
+            "image_paths": [],
+            "model_name": "none",
+            "model_family": "disabled",
+            "target_class_id": None,
+            "target_class_name": None,
+            "score_threshold": None,
+        }
+        self.outside_keypoints = {
+            "outside_masks": [],
+            "without_masks": [],
+            "outside_persons": [],
+            "without_mask_persons": [],
+            "outside_person_count": 0,
+            "without_mask_person_count": 0,
+            "mask_tolerance_px": int(self.segmentation_mask_tolerance_px),
+        }
+        self.results_mask_distance = []
 
-        self.reference_report_entries = self._load_reference_report_entries()
-        self.merged_reference_keys = self._build_reference_key_set(self.reference_report_entries["merged"])
-        self.merged_reference_image_paths = self._build_reference_image_path_set(self.reference_report_entries["merged"])
-        self.merged_reference_image_names = self._build_reference_image_name_set(self.reference_report_entries["merged"])
+    def _compute_segmentation_results(self):
+        masks = self.validator.segment_dataset_with_model(
+            model_name=self._resolved_segmentation_model_name(),
+            target_class=self.segmentation_target_class,
+            score_threshold=self.segmentation_score_threshold,
+        )
+        masks["score_threshold"] = float(self.segmentation_score_threshold)
+        self.segmentation_masks = masks
 
-        self.results_distance = []
-        if include_distance:
-            self.results_distance = globals().get("results_distance")
-            if self.results_distance is None:
-                distance_model, valid_indices = self.validator.train_distance_models(
-                    self.distance_model_name,
-                    distance_connections=self.distance_connections,
-                    visibility_threshold=self.distance_visibility_threshold,
-                )
-                self.results_distance = self.validator.predict_distance_anomalies(
-                    distance_model,
-                    valid_indices,
-                    distance_connections=self.distance_connections,
-                    visibility_threshold=self.distance_visibility_threshold,
-                    threshold_percentile=self.distance_threshold_percentile,
-                    sort_by=self.distance_sort_by,
-                )
+        results_mask = self.validator.evaluate_dataset_keypoints_against_masks(
+            masks["masks"],
+            masks["image_paths"],
+            mask_tolerance_px=int(self.segmentation_mask_tolerance_px),
+        )
+        self.outside_keypoints = self.validator.collect_visible_keypoints_outside_masks(results_mask)
+        self.outside_keypoints["mask_tolerance_px"] = int(self.segmentation_mask_tolerance_px)
+        self.results_mask_distance = self.validator.build_keypoint_mask_distance_datasets(results_mask, variant=0)
 
-        self.results_lbp = []
-        if include_lbp:
-            self.results_lbp = globals().get("results_lbp")
-            if self.results_lbp is None:
-                self.results_lbp = self.validator.predict_lbp_anomalies_by_embedding_groups(patch_size=32)
-
-        self.segmentation_masks = globals().get("masks")
-        self.outside_keypoints = globals().get("outside_keypoints")
-        self.results_mask_distance = globals().get("results_mask_distance")
-        if (not include_segmentation) or self._is_segmentation_disabled(self.segmentation_model_name):
-            self.segmentation_masks = {
-                "masks": [],
-                "image_paths": [],
-                "model_name": "none",
-                "model_family": "disabled",
-                "target_class_id": None,
-                "target_class_name": None,
-                "score_threshold": None,
-            }
-            self.outside_keypoints = {
-                "outside_masks": [],
-                "without_masks": [],
-                "outside_persons": [],
-                "without_mask_persons": [],
-                "outside_person_count": 0,
-                "without_mask_person_count": 0,
-                "mask_tolerance_px": int(self.segmentation_mask_tolerance_px),
-            }
-            self.results_mask_distance = []
-        else:
-            can_use_global_segmentation_cache = self._is_segmentation_cache_compatible(self.segmentation_masks)
-            can_use_global_outside_cache = self._is_outside_cache_compatible(self.outside_keypoints)
-
-            if not can_use_global_segmentation_cache:
-                self.segmentation_masks = None
-                self.outside_keypoints = None
-                self.results_mask_distance = None
-            elif not can_use_global_outside_cache:
-                self.outside_keypoints = None
-                self.results_mask_distance = None
-
-            if self.outside_keypoints is None or self.results_mask_distance is None:
-                if self.segmentation_masks is None:
-                    masks = self.validator.segment_dataset_with_model(
-                        model_name=self._resolved_segmentation_model_name(),
-                        target_class=self.segmentation_target_class,
-                        score_threshold=self.segmentation_score_threshold,
-                    )
-                    masks["score_threshold"] = float(self.segmentation_score_threshold)
-                    self.segmentation_masks = masks
-
-                masks = self.segmentation_masks
-                results_mask = self.validator.evaluate_dataset_keypoints_against_masks(
-                    masks["masks"],
-                    masks["image_paths"],
-                    mask_tolerance_px=int(self.segmentation_mask_tolerance_px),
-                )
-                self.outside_keypoints = self.validator.collect_visible_keypoints_outside_masks(results_mask)
-                self.outside_keypoints["mask_tolerance_px"] = int(self.segmentation_mask_tolerance_px)
-                self.results_mask_distance = self.validator.build_keypoint_mask_distance_datasets(results_mask, variant=0)
-
+    def _refresh_segmentation_lookups(self):
         self.segmentation_stats = self._summarize_segmentation_masks(self.segmentation_masks)
-
-        self.all_samples = {}
-        for sample in self.validator.dataset:
-            image_path = sample.get("image_path")
-            person_keypoints = self.validator._get_sample_person_keypoints(sample)
-            for person_id, _ in enumerate(person_keypoints):
-                self.all_samples[self._sample_key(image_path, person_id)] = {
-                    "image_path": image_path,
-                    "person_id": int(person_id),
-                }
-
-        self.distance_lookup, self.distance_total = self._build_rank_lookup(self.results_distance)
-        self.lbp_lookup, self.lbp_total = self._build_rank_lookup(self.results_lbp)
         self.mask_lookup, self.mask_total = self._build_rank_lookup(self.results_mask_distance)
         self.outside_lookup = self._build_outside_lookup(self.outside_keypoints)
         self.outside_person_total = int(
@@ -444,7 +298,70 @@ class MergedRankingEvaluator:
             self.segmentation_model_name,
         )
 
-        self._prepared = True
+    def _prepare(self, include_distance: bool = True, include_lbp: bool = True, include_segmentation: bool = True):
+        """Compute the ranking inputs that are still missing.
+
+        Each component is computed at most once and then kept. A later call that
+        includes a component skipped earlier computes it then, so the result of
+        ``run()`` does not depend on the weights of the first call.
+        """
+        if not self._prepared:
+            self.reference_report_entries = self._load_reference_report_entries()
+            self.merged_reference_keys = self._build_reference_key_set(self.reference_report_entries["merged"])
+            self.merged_reference_image_paths = self._build_reference_image_path_set(self.reference_report_entries["merged"])
+            self.merged_reference_image_names = self._build_reference_image_name_set(self.reference_report_entries["merged"])
+
+            # all_samples must exist before any rank lookup is built, because
+            # entries without person_id are resolved through it.
+            self.all_samples = {}
+            for sample in self.validator.dataset:
+                image_path = sample.get("image_path")
+                person_keypoints = self.validator._get_sample_person_keypoints(sample)
+                for person_id, _ in enumerate(person_keypoints):
+                    self.all_samples[self._sample_key(image_path, person_id)] = {
+                        "image_path": image_path,
+                        "person_id": int(person_id),
+                    }
+
+            self.results_distance = []
+            self.results_lbp = []
+            self.distance_lookup, self.distance_total = self._build_rank_lookup(self.results_distance)
+            self.lbp_lookup, self.lbp_total = self._build_rank_lookup(self.results_lbp)
+            self._set_segmentation_disabled_results()
+            self._refresh_segmentation_lookups()
+            self._prepared_components = set()
+            self._prepared = True
+
+        if include_distance and "distance" not in self._prepared_components:
+            distance_model, valid_indices = self.validator.train_distance_models(
+                self.distance_model_name,
+                distance_connections=self.distance_connections,
+                visibility_threshold=self.distance_visibility_threshold,
+            )
+            self.results_distance = self.validator.predict_distance_anomalies(
+                distance_model,
+                valid_indices,
+                distance_connections=self.distance_connections,
+                visibility_threshold=self.distance_visibility_threshold,
+                threshold_percentile=self.distance_threshold_percentile,
+                sort_by=self.distance_sort_by,
+            )
+            self.distance_lookup, self.distance_total = self._build_rank_lookup(self.results_distance)
+            self._prepared_components.add("distance")
+
+        if include_lbp and "lbp" not in self._prepared_components:
+            self.results_lbp = self.validator.predict_lbp_anomalies_by_embedding_groups(patch_size=32)
+            self.lbp_lookup, self.lbp_total = self._build_rank_lookup(self.results_lbp)
+            self._prepared_components.add("lbp")
+
+        if (
+            include_segmentation
+            and not self._is_segmentation_disabled(self.segmentation_model_name)
+            and "segmentation" not in self._prepared_components
+        ):
+            self._compute_segmentation_results()
+            self._refresh_segmentation_lookups()
+            self._prepared_components.add("segmentation")
 
     def _build_combined_ranking(self, distance_weight, lbp_weight, segmentation_weight):
         if self._is_segmentation_disabled(self.segmentation_model_name):
@@ -554,16 +471,14 @@ class MergedRankingEvaluator:
         }
         return combined, meta
 
-    # Public entrypoint
     def run(self, distance_weight, lbp_weight, segmentation_weight):
-        include_distance = float(distance_weight) > 0.0
-        include_lbp = float(lbp_weight) > 0.0
-        include_segmentation = float(segmentation_weight) > 0.0
-
+        # Segmentation is prepared even at weight 0: _build_combined_ranking always
+        # promotes persons with keypoints outside the mask to the top. Disable it
+        # with segmentation_model_name=None.
         self._prepare(
-            include_distance=include_distance,
-            include_lbp=include_lbp,
-            include_segmentation=include_segmentation,
+            include_distance=float(distance_weight) > 0.0,
+            include_lbp=float(lbp_weight) > 0.0,
+            include_segmentation=True,
         )
         combined_ranking, ranking_meta = self._build_combined_ranking(
             distance_weight,
@@ -697,12 +612,38 @@ class YPValidation_Test:
         except (ValueError, SyntaxError):
             return value
 
+    # Console line of rigid / axis-aligned results: "<image_path> <person_id> <extra>",
+    # where extra is the rotation angle or the list of changed keypoint indices.
+    _CONSOLE_RESULT_LINE = re.compile(
+        r"^(?P<path>.+?\.(?:jpe?g|png|bmp|tiff?|webp))\s+(?P<person_id>-?\d+)(?:\s+(?P<extra>.+))?$",
+        re.IGNORECASE,
+    )
+    _DETAILS_HEADER_LINE = re.compile(r"^--- details \d+ ---$")
+    _DETAILS_FIELD_LINE = re.compile(r"^(?P<key>[A-Za-z_]\w*): (?P<value>.*)$")
+
     @classmethod
     def parse_results_txt_line(cls, line: str) -> Dict[str, Any]:
         """Parse a single line from a validation results.txt file."""
         stripped = line.strip()
         if not stripped:
             raise ValueError("Empty results.txt line cannot be parsed")
+
+        console_match = cls._CONSOLE_RESULT_LINE.match(stripped)
+        if console_match and " | " not in stripped and not stripped.startswith("{"):
+            parsed_console: Dict[str, Any] = {
+                "image_path": console_match.group("path"),
+                "person_id": int(console_match.group("person_id")),
+            }
+            extra = console_match.group("extra")
+            if extra is not None:
+                extra_value = cls.parse_results_txt_value(extra)
+                if isinstance(extra_value, (list, tuple)):
+                    parsed_console["changed_keypoint_indices"] = list(extra_value)
+                elif isinstance(extra_value, (int, float)):
+                    parsed_console["rotation_angle_degrees"] = float(extra_value)
+                else:
+                    parsed_console["extra"] = extra_value
+            return parsed_console
 
         parts = [part.strip() for part in stripped.split(" | ") if part.strip()]
         parsed: Dict[str, Any] = {}
@@ -727,12 +668,29 @@ class YPValidation_Test:
     def parse_results_txt(cls, results_txt_path: str) -> List[Dict[str, Any]]:
         """Parse a validation results.txt file into structured records."""
         parsed_entries: List[Dict[str, Any]] = []
+        in_details_block = False
 
         with open(results_txt_path, "r", encoding="utf-8") as file:
             for line_number, line in enumerate(file, start=1):
                 stripped = line.strip()
                 if not stripped:
                     continue
+
+                # Multi-line details written by save_results_console_output:
+                # "--- details N ---" followed by "key: value" lines that belong
+                # to the entry above them.
+                if cls._DETAILS_HEADER_LINE.match(stripped):
+                    in_details_block = bool(parsed_entries)
+                    continue
+                if in_details_block:
+                    # A " | " line is a one-line record of its own, not a detail field.
+                    field_match = None if " | " in stripped else cls._DETAILS_FIELD_LINE.match(stripped)
+                    if field_match:
+                        parsed_entries[-1][field_match.group("key")] = cls.parse_results_txt_value(
+                            field_match.group("value")
+                        )
+                        continue
+                    in_details_block = False
 
                 try:
                     entry = cls.parse_results_txt_line(stripped)
@@ -789,6 +747,52 @@ class YPValidation_Test:
         if match_mode == "image_path_person_id":
             return image_path, cls._extract_person_identifier(entry)
         return image_path
+
+    @classmethod
+    def _match_reference_entries(
+        cls,
+        reference_entries: List[Dict[str, Any]],
+        ranked_entries: List[Dict[str, Any]],
+        top_k: int,
+        match_mode: str = "auto",
+    ) -> Tuple[str, List[Tuple[Dict[str, Any], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]]]:
+        """Pair each reference entry with its first unused match in the ranking and in its top ``top_k``.
+
+        ``match_mode="auto"`` matches on (image path, person id) when both sides
+        carry person ids, otherwise on image path. Returns the resolved match mode
+        and one ``(reference_entry, report_match, top_k_match)`` tuple per
+        reference entry, with ``None`` where nothing matched.
+        """
+        if match_mode == "auto":
+            def has_person_ids(entries):
+                return bool(entries) and all(cls._extract_person_identifier(entry) is not None for entry in entries)
+
+            match_mode = (
+                "image_path_person_id"
+                if has_person_ids(ranked_entries) and has_person_ids(reference_entries)
+                else "image_path"
+            )
+
+        ranked_entries_sorted = sorted(ranked_entries, key=lambda entry: entry.get("rank", float("inf")))
+        report_buckets: Dict[Any, List[Dict[str, Any]]] = {}
+        top_buckets: Dict[Any, List[Dict[str, Any]]] = {}
+        for position, entry in enumerate(ranked_entries_sorted):
+            identifier = cls._distance_anomaly_entry_identifier(entry, match_mode)
+            report_buckets.setdefault(identifier, []).append(entry)
+            if position < top_k:
+                top_buckets.setdefault(identifier, []).append(entry)
+
+        matches = []
+        for reference_entry in reference_entries:
+            identifier = cls._distance_anomaly_entry_identifier(reference_entry, match_mode)
+            report_bucket = report_buckets.get(identifier)
+            top_bucket = top_buckets.get(identifier)
+            matches.append((
+                reference_entry,
+                report_bucket.pop(0) if report_bucket else None,
+                top_bucket.pop(0) if top_bucket else None,
+            ))
+        return match_mode, matches
 
     @staticmethod
     def _extract_distance_anomaly_entries(raw_object: Any) -> Optional[List[Dict[str, Any]]]:
@@ -1036,53 +1040,16 @@ class YPValidation_Test:
             ranked_entries = cls._normalize_distance_anomaly_entries(extracted_entries)
             ranked_report_reference = "<in-memory>"
 
-        if match_mode == "auto":
-            candidate_has_person_ids = ranked_entries and all(
-                cls._extract_person_identifier(entry) is not None for entry in ranked_entries
-            )
-            reference_has_person_ids = reference_entries and all(
-                cls._extract_person_identifier(entry) is not None for entry in reference_entries
-            )
-            resolved_match_mode = (
-                "image_path_person_id"
-                if candidate_has_person_ids and reference_has_person_ids
-                else "image_path"
-            )
-        else:
-            resolved_match_mode = match_mode
-
-        reference_identifiers = [
-            cls._distance_anomaly_entry_identifier(entry, resolved_match_mode)
-            for entry in reference_entries
-        ]
-
-        ranked_entries_sorted = sorted(ranked_entries, key=lambda entry: entry.get("rank", float("inf")))
-        top_entries = ranked_entries_sorted[:top_k]
-
-        top_entries_by_identifier: Dict[Any, List[Dict[str, Any]]] = {}
-        report_entries_by_identifier: Dict[Any, List[Dict[str, Any]]] = {}
-
-        for entry in ranked_entries_sorted:
-            identifier = cls._distance_anomaly_entry_identifier(entry, resolved_match_mode)
-            report_entries_by_identifier.setdefault(identifier, []).append(entry)
-
-        for entry in top_entries:
-            identifier = cls._distance_anomaly_entry_identifier(entry, resolved_match_mode)
-            top_entries_by_identifier.setdefault(identifier, []).append(entry)
+        resolved_match_mode, matches = cls._match_reference_entries(
+            reference_entries, ranked_entries, top_k, match_mode
+        )
 
         requested_reference_fields = list(reference_field_names or [])
         reference_report_entries: List[Dict[str, Any]] = []
         matched_top_entries: List[Dict[str, Any]] = []
         matched_overall_entries: List[Dict[str, Any]] = []
 
-        for reference_entry in reference_entries:
-            identifier = cls._distance_anomaly_entry_identifier(reference_entry, resolved_match_mode)
-            report_match_bucket = report_entries_by_identifier.get(identifier, [])
-            top_match_bucket = top_entries_by_identifier.get(identifier, [])
-
-            report_match = report_match_bucket.pop(0) if report_match_bucket else None
-            top_match = top_match_bucket.pop(0) if top_match_bucket else None
-
+        for reference_entry, report_match, top_match in matches:
             extracted_entry = {
                 "image_path": reference_entry.get("image_path"),
                 "person_id": cls._extract_person_identifier(reference_entry),
@@ -1167,7 +1134,7 @@ class YPValidation_Test:
             "top_k": int(top_k),
             "match_mode": resolved_match_mode,
             "total_reference_entries": len(reference_entries),
-            "total_ranked_entries": len(ranked_entries_sorted),
+            "total_ranked_entries": len(ranked_entries),
             "matched_top_k_count": matched_top_count,
             "last_matched_rank_in_top_k": last_matched_rank_in_top_k,
             "matched_top_k_entries": matched_top_entries,
